@@ -1,0 +1,6 @@
+Implements a baseline phishing email classifier using Logistic Regression.
+Uses a small CSV dataset with emails labeled as phishing or legitimate.
+Converts email text into numerical features using TF-IDF vectorization.
+Trains a Logistic Regression model on the dataset.
+Saves the trained model as a .pkl file for later predictions.
+Includes a simple app.py to input new email text and predict phishing probability.
