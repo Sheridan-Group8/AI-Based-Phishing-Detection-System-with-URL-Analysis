@@ -1,19 +1,25 @@
 """
 URL Phishing Detector using Random Forest
-
-Combines:
-1. TF-IDF text analysis of URLs
-2. Structural URL features
+With PhishTank Reputation Scoring
 """
 
 import re
+import pandas as pd
 import numpy as np
+import whois
+import tldextract
+
+from datetime import datetime
 from urllib.parse import urlparse
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import RandomForestClassifier
 from scipy.sparse import hstack, csr_matrix
 
+
+# =============================================
+# URL STRUCTURAL ANALYZER
+# =============================================
 
 class URLAnalyzer:
 
@@ -47,22 +53,108 @@ class URLAnalyzer:
         parsed=urlparse(url)
         domain=parsed.netloc.lower()
 
-        # IP detection
         if re.search(r"\d+\.\d+\.\d+\.\d+",domain):
             features["has_ip"]=1
 
-        # suspicious TLD
         for tld in self.SUSPICIOUS_TLDS:
             if domain.endswith(tld):
                 features["suspicious_tld"]=1
 
-        # suspicious keyword
         for word in self.SUSPICIOUS_KEYWORDS:
             if word in url.lower():
                 features["keyword"]=1
 
         return np.array(list(features.values()))
 
+
+# =============================================
+# DOMAIN REPUTATION (PHISHTANK)
+# =============================================
+
+class DomainReputationAnalyzer:
+
+    def __init__(self, phishtank_file="phishtank.csv"):
+
+        self.bad_urls=set()
+        self.load_phishtank(phishtank_file)
+
+    def load_phishtank(self,file):
+
+        try:
+            df=pd.read_csv(file)
+
+            if "url" in df.columns:
+                self.bad_urls=set(df["url"].str.lower())
+            elif "phish_url" in df.columns:
+                self.bad_urls=set(df["phish_url"].str.lower())
+
+            print("Loaded",len(self.bad_urls),"PhishTank URLs")
+
+        except Exception as e:
+            print("PhishTank not loaded:",e)
+
+    def extract_domain(self,url):
+
+        try:
+            ext=tldextract.extract(url)
+            return f"{ext.domain}.{ext.suffix}"
+        except:
+            return None
+
+    def domain_age(self,domain):
+
+        try:
+            w=whois.whois(domain)
+            creation=w.creation_date
+
+            if isinstance(creation,list):
+                creation=creation[0]
+
+            if not creation:
+                return None
+
+            return (datetime.now()-creation).days
+
+        except:
+            return None
+
+    def score(self,url):
+
+        result={
+            "listed_phishtank":False,
+            "domain_age":None,
+            "score":0
+        }
+
+        url=url.lower()
+
+        # PhishTank blacklist
+        if url in self.bad_urls:
+            result["listed_phishtank"]=True
+            result["score"]-=0.9
+            return result
+
+        domain=self.extract_domain(url)
+
+        age=self.domain_age(domain)
+
+        result["domain_age"]=age
+
+        if age:
+
+            if age<30:
+                result["score"]-=0.4
+            elif age<90:
+                result["score"]-=0.2
+            else:
+                result["score"]+=0.1
+
+        return result
+
+
+# =============================================
+# MAIN DETECTOR
+# =============================================
 
 class URLPhishingDetector:
 
@@ -81,6 +173,8 @@ class URLPhishingDetector:
         )
 
         self.analyzer=URLAnalyzer()
+        self.reputation=DomainReputationAnalyzer()
+
         self.trained=False
 
 
@@ -137,8 +231,19 @@ class URLPhishingDetector:
 
         confidence=max(prob)
 
-        return prediction,confidence
+        # reputation adjustment
+        rep=self.reputation.score(url)
 
+        adjusted_conf=confidence+(-rep["score"]*0.3)
+
+        adjusted_conf=max(0,min(1,adjusted_conf))
+
+        return prediction,adjusted_conf,rep
+
+
+# =============================================
+# MAIN PROGRAM
+# =============================================
 
 def main():
 
@@ -147,7 +252,6 @@ def main():
 
     detector=URLPhishingDetector()
 
-    # small example dataset
     urls=[
         "paypal-secure-login.xyz/verify",
         "bank-account-update.top/login",
@@ -159,7 +263,7 @@ def main():
         "amazon.com/product"
     ]
 
-    labels=[1,1,1,1,0,0,0,0]   # 1 phishing, 0 safe
+    labels=[1,1,1,1,0,0,0,0]
 
     detector.train(urls,labels)
 
@@ -170,12 +274,14 @@ def main():
         if url.lower() in ["quit","exit"]:
             break
 
-        pred,conf=detector.predict(url)
+        pred,conf,rep=detector.predict(url)
 
         if pred==1:
             print(f"⚠ PHISHING ({conf:.2%} confidence)")
         else:
             print(f"✓ SAFE ({conf:.2%} confidence)")
+
+        print("Reputation:",rep)
 
 
 if __name__=="__main__":
