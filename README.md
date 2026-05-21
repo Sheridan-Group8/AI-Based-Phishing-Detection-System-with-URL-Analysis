@@ -1,8 +1,8 @@
 # AI-Based Phishing Detection System with URL Analysis
 
-## 📌 Capstone Project – Sheridan College  
+## Capstone Project – Sheridan College  
 **Group 8**  
-**Date:** January 19, 2026  
+**Date:** 21 May, 2026  
 
 ### 👥 Team Members
 - Aarambha Adhikari  
@@ -12,167 +12,36 @@
 
 ---
 
-## 🔐 Project Overview
+## Project Overview
+PhishGuard is a desktop-based cybersecurity application that detects phishing emails from Microsoft Outlook. It integrates Microsoft Graph API, machine learning models, URL analysis, and email header validation to classify emails and highlight potential security threats.
 
-Phishing remains one of the most damaging cybersecurity threats worldwide. Attackers use deceptive emails and malicious URLs to trick users into revealing sensitive information such as:
+The project is currently in Phase 2 development, transitioning from a proof-of-concept system to a full desktop application with persistent database storage and improved detection accuracy.
 
-- login credentials  
-- financial information  
-- personal data  
 
-Modern phishing attacks are increasingly sophisticated. Attackers now leverage AI to craft realistic and context-aware messages, making traditional rule-based filters ineffective.
+## Problem Statement
 
-This project proposes an **AI-based phishing detection system** that combines:
+Phishing emails are one of the most common cybersecurity threats, often bypassing basic email filters and targeting users through deceptive links and spoofed sender identities. Existing email clients provide limited deep analysis of URLs, sender behavior, and email structure, making users vulnerable to attacks.
 
-✅ Email content analysis  
-✅ URL intelligence analysis  
 
-to improve detection accuracy and reduce false positives.
+## Proposed Solution
 
----
+PhishGuard addresses this issue by providing an intelligent phishing detection system that:
 
-## ❗ Problem Statement
+Analyzes email content using machine learning models
+Inspects URLs using lexical and domain-based features
+Validates email authenticity using SPF, DKIM, and DMARC checks
+Stores scan history and sender data in a structured database
+Presents results through a clear desktop dashboard for user action
 
-Traditional phishing detection methods rely on:
+## Current Status (Week 3 – Phase 2)
+Database schema designed and implemented in Supabase
+Tables created for scan history, sender data, and logs
+Initial UI/UX flow defined for desktop dashboard
+System architecture finalized (Electron + Flask + Supabase)
+Backend–frontend integration and database connection pending
+Electron frontend setup planned for next phase
 
-- keyword filtering  
-- rule-based detection  
-- static blacklists  
+## Status: In Progress (On Track)
 
-These approaches fail against:
 
-- AI-generated phishing emails  
-- social engineering tactics  
-- newly registered malicious domains  
-
-An intelligent detection system is required to analyze **context, language patterns, and URL characteristics**.
-
----
-
-## 💡 Proposed Solution
-
-The system combines machine learning and security intelligence to detect phishing attempts through two components:
-
----
-
-### 📧 1. Email Phishing Detection
-
-Machine learning models will analyze email content to classify messages as **legitimate** or **phishing**.
-
-#### 📊 Datasets
-- Public phishing email datasets  
-- Enron Email Dataset (legitimate corporate communication)
-
-#### 🤖 Models
-- **Naive Bayes** — baseline classification  
-- **BERT / DistilBERT** — contextual language understanding  
-  - urgency language detection  
-  - impersonation patterns  
-  - social engineering tactics  
-
-#### 🔗 Integration
-- Microsoft Graph API for secure retrieval of Microsoft 365 emails
-
----
-
-### 🌐 2. AI-Based URL Analysis
-
-Phishing emails often include malicious links. The system evaluates URLs using structural and domain intelligence.
-
-#### 🔎 URL Structure Analysis
-- URL length and complexity  
-- use of special characters and hyphens  
-- multiple subdomains  
-- suspicious keywords  
-
-#### 🌍 Domain & Infrastructure Analysis
-- domain age and registration history  
-- DNS and SSL certificate details  
-- hosting provider & reputation indicators  
-
-#### 🧪 Future Enhancement (Optional)
-- Execute suspicious URLs in a **sandbox environment** to observe behavior safely.
-
----
-
-## 🎯 Project Impact
-
-The combined analysis approach improves detection accuracy and reduces false positives.
-
-### Benefits to Organizations
-- Detect phishing emails more effectively  
-- Prevent credential theft and financial fraud  
-- Enhance cloud email security  
-- Protect users from social engineering attacks  
-
----
-
-## ⚙️ Feasibility
-
-This project is highly feasible due to:
-
-- publicly available labeled datasets  
-- mature machine learning frameworks  
-- accessible APIs for email and domain analysis  
-- extensive research and documentation  
-
----
-
-## 🛠️ Technologies & Tools
-
-**Languages & Frameworks**
-- Python
-- Scikit-learn
-- TensorFlow / PyTorch
-- Hugging Face Transformers
-
-**Security & Analysis**
-- Microsoft Graph API
-- WHOIS & DNS lookup tools
-- SSL certificate inspection
-
-**Development Environment**
-- GitHub
-- VS Code / GitHub Codespaces
-
----
-
-## 🚀 Future Improvements
-
-- real-time email monitoring  
-- browser extension for phishing warnings  
-- sandbox detonation for malicious URLs  
-- integration with Microsoft Defender & SIEM systems  
-- model performance optimization & threat intelligence feeds  
-
----
-
-## 📚 References
-
-- Cleanfox — AI Phishing Detection  
-  https://blog.cleanfox.io/ai-phishing-detection-how-artificial-intelligence-is-changing-email-security/
-
-- H2O.ai — BERT  
-  https://h2o.ai/wiki/bert/
-
-- H2O.ai — Naive Bayes  
-  https://h2o.ai/wiki/naive-bayes/
-
-- Intezer — URL Analysis for Phishing  
-  https://intezer.com/blog/url-analysis-phishing-part-1/
-
-- Insights2TechInfo — Naive Bayes in Phishing Detection  
-  https://insights2techinfo.com/unveiling-the-power-of-naive-bayes-in-phishing-detection/
-
----
-
-## 📎 Repository
-
-GitHub Repository:  
-https://github.com/Sheridan-Group8/AI-Based-Phishing-Detection-System-with-URL-Analysis
-
----
-
-## 📜 License
-
-This project is developed for academic purposes at Sheridan College.
+## This project is developed for academic purposes at Sheridan College.
