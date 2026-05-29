@@ -33,15 +33,27 @@ Validates email authenticity using SPF, DKIM, and DMARC checks
 Stores scan history and sender data in a structured database
 Presents results through a clear desktop dashboard for user action
 
-## Current Status (Week 3 – Phase 2)
+## Current Status (Week 4 – Phase 2)
 Database schema designed and implemented in Supabase
 Tables created for scan history, sender data, and logs
-Initial UI/UX flow defined for desktop dashboard
-System architecture finalized (Electron + Flask + Supabase)
-Backend–frontend integration and database connection pending
-Electron frontend setup planned for next phase
+Supabase database connection added to the PhishGuard dashboard
+Existing dashboard integrated into a basic Electron desktop window
+Local Electron startup tested with Flask backend running on localhost
+System architecture updated to Electron + Flask + Supabase
+UI/UX flow continues to be improved for the desktop dashboard
+
+## Database Connection Note
+For now, database connection is handled from inside the app. Open PhishGuard, go to Settings, and connect to the database from there.
+
+This process is temporary. A future update will simplify the database connection flow so users do not need to manually connect through Settings.
 
 ## Status: In Progress (On Track)
+
+## In Progress
+ML/AI model accuracy improvements
+Login and authentication flow refinement
+URL and domain analysis enhancements
+User interface and dashboard usability improvements
 
 
 ## This project is developed for academic purposes at Sheridan College.
