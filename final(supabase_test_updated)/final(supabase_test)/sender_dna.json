@@ -1,0 +1,82 @@
+{
+  "sarah.chen@company.com": {
+    "email": "sarah.chen@company.com",
+    "email_count": 1,
+    "last_updated": "2026-04-05T19:30:44.810803",
+    "avg_word_count": 26.0,
+    "avg_sentence_len": 5.2,
+    "avg_word_len": 4.65,
+    "avg_caps_ratio": 0.094,
+    "avg_formality": 0.0,
+    "typical_greeting": "casual",
+    "usually_has_signature": true,
+    "typical_send_hours": [
+      9
+    ],
+    "avg_exclamations": 0.0
+  },
+  "mike.r@company.com": {
+    "email": "mike.r@company.com",
+    "email_count": 1,
+    "last_updated": "2026-04-01T15:15:35.409121",
+    "avg_word_count": 14.0,
+    "avg_sentence_len": 4.67,
+    "avg_word_len": 3.71,
+    "avg_caps_ratio": 0.0606,
+    "avg_formality": 0.0,
+    "typical_greeting": "none",
+    "usually_has_signature": false,
+    "typical_send_hours": [
+      8
+    ],
+    "avg_exclamations": 1.0
+  },
+  "shipment-tracking@amazon.com": {
+    "email": "shipment-tracking@amazon.com",
+    "email_count": 1,
+    "last_updated": "2026-04-01T20:19:33.670576",
+    "avg_word_count": 18.0,
+    "avg_sentence_len": 9.0,
+    "avg_word_len": 6.67,
+    "avg_caps_ratio": 0.0714,
+    "avg_formality": 0.0,
+    "typical_greeting": "casual",
+    "usually_has_signature": false,
+    "typical_send_hours": [
+      22
+    ],
+    "avg_exclamations": 1.0
+  },
+  "security-alert@m1cr0soft-support.com": {
+    "email": "security-alert@m1cr0soft-support.com",
+    "email_count": 1,
+    "last_updated": "2026-04-02T12:41:52.707533",
+    "avg_word_count": 36.0,
+    "avg_sentence_len": 7.2,
+    "avg_word_len": 7.47,
+    "avg_caps_ratio": 0.0874,
+    "avg_formality": 0.0,
+    "typical_greeting": "none",
+    "usually_has_signature": false,
+    "typical_send_hours": [
+      14
+    ],
+    "avg_exclamations": 0.0
+  },
+  "lisa.park@company.com": {
+    "email": "lisa.park@company.com",
+    "email_count": 1,
+    "last_updated": "2026-04-01T20:24:47.369989",
+    "avg_word_count": 36.0,
+    "avg_sentence_len": 12.0,
+    "avg_word_len": 4.28,
+    "avg_caps_ratio": 0.1088,
+    "avg_formality": -0.0278,
+    "typical_greeting": "casual",
+    "usually_has_signature": true,
+    "typical_send_hours": [
+      17
+    ],
+    "avg_exclamations": 0.0
+  }
+}

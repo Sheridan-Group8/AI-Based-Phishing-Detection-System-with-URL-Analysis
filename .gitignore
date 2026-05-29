@@ -1,0 +1,32 @@
+# Python environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local/editor files
+.DS_Store
+Thumbs.db
+__MACOSX/
+._*
+.idea/
+.vscode/
+
+# Packaged exports and large archives
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.log
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# JavaScript dependencies/build outputs
+node_modules/
+dist/
+build/
