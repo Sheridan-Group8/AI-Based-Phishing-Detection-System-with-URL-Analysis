@@ -30,6 +30,4 @@ __MACOSX/
 node_modules/
 dist/
 build/
-
-
 final(supabase_test_updated)/
