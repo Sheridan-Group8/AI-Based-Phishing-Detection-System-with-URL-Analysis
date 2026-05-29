@@ -47,13 +47,15 @@ For now, database connection is handled from inside the app. Open PhishGuard, go
 
 This process is temporary. A future update will simplify the database connection flow so users do not need to manually connect through Settings.
 
+## In Progress
+- ML/AI model accuracy improvements
+- Login and authentication flow refinement
+- URL and domain analysis enhancements
+- User interface and dashboard usability improvements
+
 ## Status: In Progress (On Track)
 
-## In Progress
-ML/AI model accuracy improvements
-Login and authentication flow refinement
-URL and domain analysis enhancements
-User interface and dashboard usability improvements
+
 
 
 ## This project is developed for academic purposes at Sheridan College.
