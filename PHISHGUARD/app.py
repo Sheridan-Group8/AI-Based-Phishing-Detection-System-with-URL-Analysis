@@ -1,0 +1,1018 @@
+"""
+PhishGuard Web Dashboard — Flask Backend
+Serves the SPA and provides REST API for phishing email analysis.
+"""
+
+import base64
+import hashlib
+import html
+import json
+import os
+import re
+import secrets
+import socket
+from datetime import datetime, timedelta
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import urlencode
+
+from flask import Flask, jsonify, redirect, request, send_from_directory, session
+
+from phishing_detector import PhishingDetector
+
+try:
+    import requests as http_requests
+except ImportError:
+    http_requests = None
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Flask App
+# ─────────────────────────────────────────────────────────────────────────────
+app = Flask(__name__, static_folder="static", template_folder="templates")
+app.secret_key = secrets.token_hex(32)
+
+# Supabase database integration. The browser sends a Supabase access token in
+# Authorization; Flask uses it with the anon key so database RLS scopes writes.
+def _load_supabase_config():
+    path = Path(__file__).parent / "static" / "js" / "supabase-config.js"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return "", ""
+
+    url_match = re.search(r"SUPABASE_URL:\s*['\"]([^'\"]+)['\"]", text)
+    key_match = re.search(r"SUPABASE_ANON_KEY:\s*['\"]([^'\"]+)['\"]", text)
+    url = url_match.group(1).strip() if url_match else ""
+    key = key_match.group(1).strip() if key_match else ""
+    if "YOUR_PROJECT_REF" in url or "YOUR_ANON" in key:
+        return "", ""
+    return url, key
+
+
+SUPABASE_URL, SUPABASE_ANON_KEY = _load_supabase_config()
+
+
+def _request_jwt():
+    auth = request.headers.get("Authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return None
+    token = auth.split(" ", 1)[1].strip()
+    return token or None
+
+
+def _jwt_user_id(jwt):
+    if not jwt or "." not in jwt:
+        return None
+    try:
+        payload = jwt.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+        return data.get("sub")
+    except Exception:
+        return None
+
+
+def _supabase_request(method, path, jwt, json_body=None, params=None,
+                      prefer="return=minimal"):
+    if not (SUPABASE_URL and SUPABASE_ANON_KEY and jwt and http_requests):
+        return None
+
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{path.lstrip('/')}"
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {jwt}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+
+    try:
+        return http_requests.request(
+            method, url, headers=headers, json=json_body, params=params,
+            timeout=(3.05, 10),
+        )
+    except Exception as exc:
+        print(f"WARNING: Supabase {method} {path} failed: {exc}")
+        return None
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Load Model
+# ─────────────────────────────────────────────────────────────────────────────
+detector = PhishingDetector()
+MODEL_PATH = Path(__file__).parent / "phishing_model.pkl"
+try:
+    detector.load_model(str(MODEL_PATH))
+    print("PhishGuard model loaded successfully.")
+except Exception as e:
+    print(f"WARNING: Could not load model: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Server-side scan results cache
+# ─────────────────────────────────────────────────────────────────────────────
+scan_results = {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Session Log
+# ─────────────────────────────────────────────────────────────────────────────
+LOG_FILE = Path(__file__).parent / "phishguard_log.txt"
+
+
+def _log_session_event(event, details=None):
+    """Append a formatted entry to the session log file."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "=" * 60,
+        f"  {event}",
+        f"  Time: {timestamp}",
+    ]
+    if details:
+        for key, value in details.items():
+            lines.append(f"  {key}: {value}")
+    lines.append("=" * 60)
+    lines.append("")
+
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Domain Reputation System
+# ─────────────────────────────────────────────────────────────────────────────
+_TRUSTED_DOMAINS = frozenset({
+    # Major email providers
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+    "msn.com", "yahoo.com", "ymail.com", "aol.com", "icloud.com", "me.com",
+    "mac.com", "protonmail.com", "proton.me", "zoho.com", "mail.com",
+    "gmx.com", "gmx.net", "fastmail.com", "tutanota.com", "hey.com",
+    # Tech companies
+    "google.com", "microsoft.com", "apple.com", "amazon.com", "meta.com",
+    "facebook.com", "instagram.com", "twitter.com", "x.com", "linkedin.com",
+    "github.com", "gitlab.com", "atlassian.com", "slack.com", "zoom.us",
+    "dropbox.com", "salesforce.com", "adobe.com", "oracle.com", "ibm.com",
+    "intel.com", "cisco.com", "vmware.com", "shopify.com", "stripe.com",
+    "twilio.com", "cloudflare.com", "digitalocean.com", "heroku.com",
+    "notion.so", "figma.com", "canva.com", "spotify.com", "netflix.com",
+    # Financial / payments
+    "paypal.com", "chase.com", "bankofamerica.com", "wellsfargo.com",
+    "citibank.com", "americanexpress.com", "discover.com", "capitalone.com",
+    "fidelity.com", "schwab.com", "venmo.com", "squareup.com",
+    # Services / social
+    "uber.com", "lyft.com", "airbnb.com", "doordash.com", "grubhub.com",
+    "reddit.com", "pinterest.com", "tiktok.com", "snapchat.com",
+    "whatsapp.com", "telegram.org", "signal.org", "discord.com",
+    # Enterprise / productivity
+    "jira.com", "trello.com", "asana.com", "monday.com",
+    "hubspot.com", "zendesk.com", "intercom.com", "mailchimp.com",
+    "sendgrid.net", "amazonaws.com", "azure.com",
+    # Education / government
+    "edu", "gov", "mil",
+})
+
+_SUSPICIOUS_TLDS = frozenset({
+    ".xyz", ".top", ".buzz", ".click", ".club", ".info", ".win", ".bid",
+    ".loan", ".racing", ".review", ".stream", ".gq", ".cf", ".tk", ".ml",
+    ".ga", ".pw", ".work", ".party", ".date", ".trade", ".webcam",
+    ".science", ".accountant", ".cricket", ".faith", ".zip", ".mov",
+})
+
+_FREEMAIL_DOMAINS = frozenset({
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+    "yahoo.com", "ymail.com", "aol.com", "icloud.com", "me.com", "mac.com",
+    "protonmail.com", "proton.me", "zoho.com", "mail.com", "gmx.com",
+    "gmx.net", "fastmail.com", "tutanota.com",
+})
+
+# Cache for WHOIS / DNS lookups (domain -> result dict)
+_domain_rep_cache = {}
+
+
+def _get_domain_age(domain):
+    """Try to get domain age in days via python-whois. Returns None if unavailable."""
+    try:
+        import whois
+        from datetime import datetime, timezone
+        w = whois.whois(domain)
+        created = w.creation_date
+        if isinstance(created, list):
+            created = created[0]
+        if created:
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - created).days
+            return max(0, age)
+    except Exception:
+        pass
+    return None
+
+
+def _check_dns(domain):
+    """Check if domain resolves via DNS. Returns True/False/None."""
+    try:
+        socket.getaddrinfo(domain, None, socket.AF_INET, socket.SOCK_STREAM)
+        return True
+    except socket.gaierror:
+        return False
+    except Exception:
+        return None
+
+
+def _check_phishtank(domain):
+    """Check if a domain is in PhishTank's database. Returns True/False/None."""
+    if not http_requests:
+        return None
+    try:
+        url = f"http://{domain}/"
+        resp = http_requests.post(
+            "https://checkurl.phishtank.com/checkurl/",
+            data={"url": url, "format": "json"},
+            headers={"User-Agent": "phishtank/PhishGuard"},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            results = data.get("results", {})
+            return results.get("in_database", False) and results.get("valid", False)
+    except Exception:
+        pass
+    return None
+
+
+def _check_domain_reputation(domain):
+    """
+    Compute a worldwide reputation score for a domain (0.0-1.0).
+    Uses multiple heuristics without requiring API keys:
+      - Trusted domain list match
+      - TLD risk analysis
+      - Domain age via WHOIS (if available)
+      - Structural analysis (impersonation patterns)
+      - DNS existence check
+    Results are cached to avoid repeated lookups.
+    """
+    if not domain:
+        return {"score": 0.5, "signals": [], "category": "unknown"}
+
+    domain = domain.lower().strip()
+    if domain in _domain_rep_cache:
+        return _domain_rep_cache[domain]
+
+    score = 0.5
+    signals = []
+
+    # 1. Trusted domain list
+    is_trusted = (
+        domain in _TRUSTED_DOMAINS
+        or any(domain.endswith("." + td) for td in _TRUSTED_DOMAINS)
+        or domain.split(".")[-1] in _TRUSTED_DOMAINS  # .edu, .gov, .mil
+    )
+    if is_trusted:
+        score += 0.35
+        signals.append(("trusted", "Globally recognized domain"))
+
+    is_freemail = domain in _FREEMAIL_DOMAINS
+    if is_freemail:
+        signals.append(("freemail", "Free email provider — anyone can register"))
+        score -= 0.05  # slight reduction since freemail can be abused
+
+    # 2. TLD risk analysis
+    tld = "." + domain.split(".")[-1] if "." in domain else ""
+    if tld in _SUSPICIOUS_TLDS:
+        score -= 0.25
+        signals.append(("bad_tld", f"Uses high-risk TLD ({tld})"))
+    elif tld in (".com", ".org", ".net", ".co"):
+        score += 0.05
+        signals.append(("good_tld", "Common, established TLD"))
+
+    # 3. Structural analysis
+    name_part = domain.split(".")[0] if "." in domain else domain
+
+    # Excessive hyphens -> impersonation / DGA
+    if name_part.count("-") >= 2:
+        score -= 0.15
+        signals.append(("hyphens", "Multiple hyphens — common in fake domains"))
+
+    # Numbers mixed with letters in the name (e.g., g00gle, paypa1)
+    has_digits = bool(re.search(r'\d', name_part))
+    has_letters = bool(re.search(r'[a-z]', name_part))
+    if has_digits and has_letters and len(name_part) > 6:
+        score -= 0.15
+        signals.append(("mixedchars", "Mix of letters and numbers — possible impersonation"))
+
+    # Very long domain name
+    if len(name_part) > 20:
+        score -= 0.1
+        signals.append(("long_name", "Unusually long domain name"))
+
+    # Brand impersonation patterns
+    _brands = ["paypal", "apple", "google", "microsoft", "amazon", "chase",
+               "wellsfargo", "bankofamerica", "netflix", "facebook", "instagram"]
+    for brand in _brands:
+        if brand in name_part and domain not in _TRUSTED_DOMAINS:
+            score -= 0.25
+            signals.append(("impersonation", f"Contains '{brand}' but isn't the real domain"))
+            break
+
+    # 4. Domain age via WHOIS
+    domain_age_days = _get_domain_age(domain)
+    if domain_age_days is not None:
+        if domain_age_days < 30:
+            score -= 0.25
+            signals.append(("new_domain", f"Domain is only {domain_age_days} days old"))
+        elif domain_age_days < 180:
+            score -= 0.1
+            signals.append(("young_domain", f"Domain is {domain_age_days} days old"))
+        elif domain_age_days > 365 * 3:
+            score += 0.1
+            years = domain_age_days // 365
+            signals.append(("established", f"Domain has been active for {years}+ years"))
+
+    # 5. DNS existence check
+    dns_exists = _check_dns(domain)
+    if dns_exists is False:
+        score -= 0.3
+        signals.append(("no_dns", "Domain does not resolve — may not exist"))
+    elif dns_exists is True and not is_trusted:
+        signals.append(("dns_ok", "Domain resolves in DNS"))
+
+    # 6. PhishTank database check
+    phishtank_hit = _check_phishtank(domain)
+    if phishtank_hit is True:
+        score -= 0.5
+        signals.append(("phishtank", "Listed in PhishTank as a known phishing site"))
+    elif phishtank_hit is False:
+        signals.append(("phishtank_clean", "Not found in PhishTank database"))
+
+    # Clamp
+    score = max(0.0, min(1.0, score))
+
+    # Categorize
+    if score >= 0.7:
+        category = "trusted"
+    elif score >= 0.4:
+        category = "neutral"
+    else:
+        category = "suspicious"
+
+    result = {"score": score, "signals": signals, "category": category}
+    _domain_rep_cache[domain] = result
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  HTML to Text
+# ─────────────────────────────────────────────────────────────────────────────
+class _HTMLTextExtractor(HTMLParser):
+    """Strip HTML tags and decode entities, skipping non-visible content."""
+    _SKIP_TAGS = {"style", "script", "head", "title"}
+    _BLOCK_TAGS = {
+        "p", "div", "br", "hr", "li", "tr", "h1", "h2", "h3", "h4", "h5",
+        "h6", "blockquote", "pre", "table", "thead", "tbody", "tfoot",
+        "section", "article", "header", "footer", "nav", "ul", "ol",
+    }
+
+    def __init__(self):
+        super().__init__()
+        self._parts = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        tag_l = tag.lower()
+        if tag_l in self._SKIP_TAGS:
+            self._skip_depth += 1
+        elif self._skip_depth == 0 and tag_l in self._BLOCK_TAGS:
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag):
+        tag_l = tag.lower()
+        if tag_l in self._SKIP_TAGS:
+            self._skip_depth = max(0, self._skip_depth - 1)
+        elif self._skip_depth == 0 and tag_l in self._BLOCK_TAGS:
+            self._parts.append("\n")
+
+    def handle_data(self, data):
+        if self._skip_depth == 0:
+            self._parts.append(data)
+
+    def handle_entityref(self, name):
+        if self._skip_depth == 0:
+            self._parts.append(html.unescape(f"&{name};"))
+
+    def handle_charref(self, name):
+        if self._skip_depth == 0:
+            self._parts.append(html.unescape(f"&#{name};"))
+
+    def get_text(self):
+        return "".join(self._parts)
+
+
+def _html_to_text(raw_html):
+    """Safely convert HTML to clean plain text."""
+    try:
+        parser = _HTMLTextExtractor()
+        parser.feed(raw_html)
+        text = parser.get_text()
+    except Exception:
+        text = re.sub(r'<[^>]+>', ' ', raw_html)
+    # Collapse spaces/tabs within each line, then collapse 3+ newlines to 2
+    lines = [re.sub(r'[^\S\n]+', ' ', ln).strip() for ln in text.splitlines()]
+    text = "\n".join(lines)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  API Routes
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    """Serve the SPA."""
+    return send_from_directory("templates", "index.html")
+
+
+@app.route("/api/log", methods=["GET"])
+def get_log():
+    """Return the session log file contents."""
+    if not LOG_FILE.exists():
+        return jsonify({"log": "No session activity recorded yet."})
+    text = LOG_FILE.read_text(encoding="utf-8")
+    return jsonify({"log": text})
+
+
+@app.route("/api/log/download", methods=["GET"])
+def download_log():
+    """Download the session log as a text file."""
+    if not LOG_FILE.exists():
+        return "No log file yet.", 404
+    return send_from_directory(
+        str(LOG_FILE.parent), LOG_FILE.name,
+        as_attachment=True, mimetype="text/plain"
+    )
+
+
+@app.route("/api/reputation/<domain>", methods=["GET"])
+def get_reputation(domain):
+    """Return worldwide domain reputation."""
+    rep = _check_domain_reputation(domain)
+    # Convert signal tuples to serializable dicts
+    serializable_signals = [
+        {"type": sig[0], "message": sig[1]} for sig in rep.get("signals", [])
+    ]
+    return jsonify({
+        "domain": domain,
+        "score": rep["score"],
+        "signals": serializable_signals,
+        "category": rep["category"],
+    })
+
+
+@app.route("/api/db/status", methods=["GET"])
+def db_status():
+    """Show whether Supabase config and a browser JWT are available."""
+    jwt = _request_jwt()
+    return jsonify({
+        "configured": bool(SUPABASE_URL and SUPABASE_ANON_KEY),
+        "authenticated": bool(_jwt_user_id(jwt)),
+    })
+
+
+@app.route("/api/report-sender", methods=["POST"])
+def report_sender():
+    """Persist an explicit sender-domain report to Supabase threat_reports."""
+    data = request.get_json(silent=True) or {}
+    domain = (data.get("domain") or "").strip().lower()
+    is_phishing = bool(data.get("is_phishing", True))
+    if not domain:
+        return jsonify({"error": "domain required"}), 400
+
+    jwt = _request_jwt()
+    user_id = _jwt_user_id(jwt)
+    if not (jwt and user_id):
+        return jsonify({"error": "Supabase sign-in required"}), 401
+
+    resp = _supabase_request(
+        "POST", "threat_reports", jwt,
+        json_body={
+            "reporter_id": user_id,
+            "domain": domain,
+            "category": "phishing" if is_phishing else "safe",
+        },
+        prefer="resolution=ignore-duplicates,return=minimal",
+    )
+    if resp is not None and resp.status_code >= 400 and resp.status_code != 409:
+        return jsonify({"error": "Supabase insert failed"}), 502
+    return jsonify({"ok": True})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Microsoft Graph API Client (OAuth2 Auth Code + PKCE)
+# ─────────────────────────────────────────────────────────────────────────────
+AUTHORITY = "https://login.microsoftonline.com/common"
+GRAPH_URL = "https://graph.microsoft.com/v1.0"
+SCOPES = ["Mail.Read", "User.Read"]
+REDIRECT_URI = "http://localhost:5050/auth/callback"
+
+# Server-side state for the authenticated session
+_graph_token = {"access_token": None, "expiry": None}
+_graph_user = {"name": "", "email": ""}  # user info — stored server-side, not in session
+_live_emails = []  # emails fetched from real Outlook
+_pending_oauth = {}  # state -> {client_id, verifier, expires} — avoids session cookie issues in popup
+_OAUTH_TIMEOUT = timedelta(minutes=10)  # pending auth requests expire after 10 min
+_live_mode = False  # True when connected to real Outlook
+
+
+def _generate_pkce():
+    verifier = secrets.token_urlsafe(64)[:128]
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def _graph_request(endpoint, params=None):
+    if not _graph_token["access_token"]:
+        raise ValueError("Not authenticated")
+    if _graph_token["expiry"] and datetime.now() >= _graph_token["expiry"]:
+        _graph_token["access_token"] = None
+        _graph_token["expiry"] = None
+        raise ValueError("Token expired")
+    headers = {
+        "Authorization": f"Bearer {_graph_token['access_token']}",
+        "Content-Type": "application/json",
+    }
+    r = http_requests.get(f"{GRAPH_URL}/{endpoint}", headers=headers, params=params)
+    if r.status_code == 401:
+        _graph_token["access_token"] = None
+        _graph_token["expiry"] = None
+        raise ValueError("Token expired")
+    r.raise_for_status()
+    return r.json()
+
+
+def _fetch_all_emails():
+    """Fetch all inbox emails via pagination."""
+    all_emails = []
+    params = {
+        "$top": 250,
+        "$select": "id,subject,from,receivedDateTime,bodyPreview,body,isRead,internetMessageHeaders,hasAttachments",
+        "$orderby": "receivedDateTime desc",
+    }
+    result = _graph_request("me/mailFolders/inbox/messages", params)
+    all_emails.extend(result.get("value", []))
+
+    # Follow @odata.nextLink until no more pages
+    next_link = result.get("@odata.nextLink")
+    while next_link:
+        headers = {
+            "Authorization": f"Bearer {_graph_token['access_token']}",
+            "Content-Type": "application/json",
+        }
+        r = http_requests.get(next_link, headers=headers)
+        if r.status_code == 401:
+            _graph_token["access_token"] = None
+            _graph_token["expiry"] = None
+            raise ValueError("Token expired")
+        r.raise_for_status()
+        data = r.json()
+        all_emails.extend(data.get("value", []))
+        next_link = data.get("@odata.nextLink")
+
+    return all_emails
+
+
+# ── OAuth Routes ─────────────────────────────────────────────────────────────
+
+@app.route("/api/auth/status", methods=["GET"])
+def auth_status():
+    """Return current connection status."""
+    connected = bool(_graph_token["access_token"] and _live_mode)
+    return jsonify({
+        "connected": connected,
+        "live_mode": _live_mode,
+        "user_name": _graph_user["name"],
+        "user_email": _graph_user["email"],
+    })
+
+
+@app.route("/api/auth/connect", methods=["POST"])
+def auth_connect():
+    """Start OAuth flow — returns the Microsoft login URL."""
+    global _live_mode
+    if http_requests is None:
+        return jsonify({"error": "requests library not installed"}), 500
+
+    data = request.get_json(silent=True) or {}
+    client_id = data.get("client_id", "").strip()
+    if not client_id:
+        return jsonify({"error": "Client ID required"}), 400
+
+    # Store client_id and PKCE server-side (not in session — popup may lose cookie)
+    verifier, challenge = _generate_pkce()
+    state = secrets.token_urlsafe(32)
+
+    # Clean up expired pending requests
+    now = datetime.now()
+    expired = [k for k, v in _pending_oauth.items() if now >= v["expires"]]
+    for k in expired:
+        del _pending_oauth[k]
+
+    _pending_oauth[state] = {
+        "client_id": client_id,
+        "verifier": verifier,
+        "expires": now + _OAUTH_TIMEOUT,
+    }
+
+    params = {
+        "client_id": client_id,
+        "response_type": "code",
+        "redirect_uri": REDIRECT_URI,
+        "scope": " ".join(SCOPES),
+        "response_mode": "query",
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    auth_url = f"{AUTHORITY}/oauth2/v2.0/authorize?{urlencode(params)}"
+    return jsonify({"auth_url": auth_url})
+
+
+@app.route("/auth/callback")
+def auth_callback():
+    """Handle Microsoft OAuth redirect callback."""
+    global _graph_token, _live_emails, _live_mode
+
+    error = request.args.get("error")
+    if error:
+        desc = request.args.get("error_description", error)
+        return f"""<html><body style="font-family:system-ui;text-align:center;padding:60px">
+        <h2>Sign-in Failed</h2><p>{html.escape(str(desc))}</p>
+        <p>You can close this tab.</p></body></html>"""
+
+    received_state = request.args.get("state")
+    pending = _pending_oauth.pop(received_state, None)
+    if not pending or datetime.now() >= pending["expires"]:
+        return f"""<html><body style="font-family:system-ui;text-align:center;padding:60px">
+        <h2>Error</h2><p>Invalid or expired state parameter.</p>
+        <p>You can close this tab.</p></body></html>"""
+
+    code = request.args.get("code")
+    if not code:
+        return f"""<html><body style="font-family:system-ui;text-align:center;padding:60px">
+        <h2>Error</h2><p>No authorization code received.</p>
+        <p>You can close this tab.</p></body></html>"""
+
+    # Exchange code for token
+    client_id = pending["client_id"]
+    verifier = pending["verifier"]
+    token_url = f"{AUTHORITY}/oauth2/v2.0/token"
+    token_data = {
+        "client_id": client_id,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
+        "code_verifier": verifier,
+        "scope": " ".join(SCOPES),
+    }
+
+    try:
+        r = http_requests.post(token_url, data=token_data)
+        if r.status_code != 200:
+            err = r.json()
+            desc = err.get("error_description", err.get("error", "Token exchange failed"))
+            short = desc.split("\r\n")[0] if "\r\n" in desc else desc
+            return f"""<html><body style="font-family:system-ui;text-align:center;padding:60px">
+            <h2>Sign-in Failed</h2><p>{html.escape(str(short))}</p>
+            <p>You can close this tab.</p></body></html>"""
+
+        tokens = r.json()
+        access_token = tokens.get("access_token")
+        expires_in = int(tokens.get("expires_in", 3600))
+
+        # Temporarily set token so _graph_request works, but don't expose
+        # to the poll yet (poll checks _graph_token to decide "connected")
+        _graph_token["access_token"] = access_token
+        _graph_token["expiry"] = datetime.now() + timedelta(seconds=expires_in)
+
+        # Get user info
+        try:
+            user_info = _graph_request("me")
+            _graph_user["name"] = user_info.get("displayName", "User")
+            _graph_user["email"] = user_info.get("mail") or user_info.get("userPrincipalName", "")
+        except Exception:
+            _graph_user["name"] = "Connected"
+            _graph_user["email"] = ""
+
+        # Fetch emails before marking live mode — prevents race where
+        # the main window poll sees "connected" but emails aren't loaded yet
+        try:
+            _live_emails = _fetch_all_emails()
+        except Exception as e:
+            _live_emails = []
+
+        # Now mark live — the poll will see "connected" and loadEmails()
+        # will return the real emails
+        _live_mode = True
+
+        # Clear any previous scan results
+        scan_results.clear()
+
+        # Log the login
+        _log_session_event("LOGIN", {
+            "User": _graph_user["name"],
+            "Email": _graph_user["email"],
+            "Emails Loaded": len(_live_emails),
+        })
+
+    except Exception as e:
+        return f"""<html><body style="font-family:system-ui;text-align:center;padding:60px">
+        <h2>Error</h2><p>{html.escape(str(e))}</p>
+        <p>You can close this tab.</p></body></html>"""
+
+    return f"""<html><body style="font-family:system-ui;text-align:center;padding:60px">
+    <h2>Connected to Outlook</h2>
+    <p>Signed in as {_graph_user['name'] or 'User'}</p>
+    <p>You can close this tab and return to PhishGuard.</p>
+    <script>window.close();</script></body></html>"""
+
+
+@app.route("/api/auth/disconnect", methods=["POST"])
+def auth_disconnect():
+    """Disconnect from Outlook and log session summary."""
+    global _graph_token, _live_emails, _live_mode
+
+    # Compute scan stats before clearing
+    total_emails = len(_live_emails)
+    total_scanned = len(scan_results)
+    threats = sum(1 for r in scan_results.values() if r.get("prediction") == 1)
+    safe = total_scanned - threats
+
+    _log_session_event("LOGOUT", {
+        "User": _graph_user["name"],
+        "Email": _graph_user["email"],
+        "Total Emails": total_emails,
+        "Emails Scanned": total_scanned,
+        "Phishing Detected": threats,
+        "Safe Emails": safe,
+    })
+
+    _graph_token = {"access_token": None, "expiry": None}
+    _graph_user["name"] = ""
+    _graph_user["email"] = ""
+    _live_emails = []
+    _live_mode = False
+    scan_results.clear()
+    _pending_oauth.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/auth/refresh", methods=["POST"])
+def auth_refresh_emails():
+    """Re-fetch emails from Outlook."""
+    global _live_emails
+    if not _live_mode or not _graph_token["access_token"]:
+        return jsonify({"error": "Not connected"}), 401
+    try:
+        _live_emails = _fetch_all_emails()
+        scan_results.clear()
+        return jsonify({"count": len(_live_emails)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ── Patch email endpoints to support live mode ───────────────────────────────
+
+def _get_email_list():
+    """Return the active email list (live emails when connected, empty otherwise)."""
+    return _live_emails if _live_mode else []
+
+
+def _parse_auth_headers(internet_headers):
+    """Parse internetMessageHeaders list into {spf, dkim, dmarc}."""
+    result = {"spf": "none", "dkim": "none", "dmarc": "none"}
+    if not internet_headers:
+        return result
+    for h in internet_headers:
+        if h.get("name", "").lower() == "authentication-results":
+            val = h.get("value", "").lower()
+            for key in ("spf", "dkim", "dmarc"):
+                if f"{key}=pass" in val:
+                    result[key] = "pass"
+                elif f"{key}=fail" in val or f"{key}=softfail" in val:
+                    result[key] = "fail"
+            break
+    return result
+
+
+def _normalize_email(email, idx):
+    """Convert Graph API / mock email to flat format the frontend expects."""
+    # Extract sender info
+    sender = email.get("from", {})
+    if "emailAddress" in sender:
+        sender_name = sender["emailAddress"].get("name", "")
+        sender_addr = sender["emailAddress"].get("address", "")
+    else:
+        sender_name = sender.get("name", "")
+        sender_addr = sender.get("address", "")
+
+    # Extract body — same approach as the desktop GUI
+    body_raw = email.get("body", {})
+    if isinstance(body_raw, dict):
+        body_content = body_raw.get("content", "") or ""
+    elif isinstance(body_raw, str):
+        body_content = body_raw
+    else:
+        body_content = email.get("bodyPreview", "") or ""
+    body_text = _html_to_text(body_content) if body_content else ""
+
+    # Parse auth headers
+    headers = _parse_auth_headers(email.get("internetMessageHeaders"))
+
+    return {
+        "idx": idx,
+        "subject": email.get("subject", "(No Subject)"),
+        "sender_name": sender_name,
+        "sender": sender_addr,
+        "date": email.get("receivedDateTime", ""),
+        "isRead": bool(email.get("isRead", True)),
+        "bodyPreview": email.get("bodyPreview", ""),
+        "body": body_text,
+        "hasAttachments": email.get("hasAttachments", False),
+        "attachments": email.get("attachments", []),
+        "headers": headers,
+        "scanned": idx in scan_results,
+        "scanResult": scan_results.get(idx),
+    }
+
+
+@app.route("/api/emails", methods=["GET"])
+def get_emails_v2():
+    emails = _get_email_list()
+    emails_summary = [_normalize_email(email, i) for i, email in enumerate(emails)]
+    return jsonify({"emails": emails_summary})
+
+
+@app.route("/api/emails/<int:idx>", methods=["GET"])
+def get_email_v2(idx):
+    emails = _get_email_list()
+    if idx < 0 or idx >= len(emails):
+        return jsonify({"error": "Email not found"}), 404
+    return jsonify(_normalize_email(emails[idx], idx))
+
+
+def _to_native(obj):
+    """Recursively convert numpy/non-JSON types to native Python types."""
+    if obj is None or isinstance(obj, (str, bool)):
+        return obj
+    if hasattr(obj, 'item'):  # numpy scalar
+        return obj.item()
+    if isinstance(obj, (int, float)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _to_native(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_native(v) for v in obj]
+    try:
+        return float(obj)
+    except (TypeError, ValueError):
+        return str(obj)
+
+
+def _make_serializable(url_analysis, header_result):
+    """Convert all scan result data to JSON-serializable Python types."""
+    return _to_native(url_analysis), _to_native(header_result)
+
+
+def _sender_address(email):
+    sender = email.get("from", {})
+    if isinstance(sender, dict) and "emailAddress" in sender:
+        return sender["emailAddress"].get("address", "") or ""
+    if isinstance(sender, dict):
+        return sender.get("email", "") or sender.get("address", "") or ""
+    return ""
+
+
+def _scan_history_row(email, result):
+    """Build DB-safe scan metadata. Never stores message body or attachments."""
+    sender_addr = _sender_address(email)
+    domain = sender_addr.split("@")[-1].lower() if "@" in sender_addr else None
+    return {
+        "message_id": str(email.get("id") or result.get("idx") or ""),
+        "sender_domain": domain,
+        "prediction": int(result.get("prediction", 0)),
+        "confidence": float(result.get("confidence", 0) or 0),
+        "signals": {
+            "url_analysis": _to_native(result.get("url_analysis")),
+            "header_result": _to_native(result.get("header_result")),
+        },
+    }
+
+
+def _persist_scan_history(email, result):
+    jwt = _request_jwt()
+    user_id = _jwt_user_id(jwt)
+    if not (jwt and user_id):
+        return
+
+    row = _scan_history_row(email, result)
+    row["user_id"] = user_id
+    resp = _supabase_request("POST", "scan_history", jwt, json_body=row)
+    if resp is not None and resp.status_code >= 400:
+        print(f"WARNING: scan_history insert failed "
+              f"[{resp.status_code}]: {resp.text[:200]}")
+
+
+@app.route("/api/scan/<int:idx>", methods=["POST"])
+def scan_email_v2(idx):
+    emails = _get_email_list()
+    if idx < 0 or idx >= len(emails):
+        return jsonify({"error": "Email not found"}), 404
+    if not detector.is_trained:
+        return jsonify({"error": "Model not loaded"}), 503
+
+    email = emails[idx]
+    subject = email.get("subject", "") or ""
+    body_raw = email.get("body")
+    if isinstance(body_raw, dict):
+        body = body_raw.get("content", "") or ""
+    elif isinstance(body_raw, str):
+        body = body_raw
+    else:
+        body = email.get("bodyPreview", "") or ""
+    body_t = _html_to_text(body) if body else ""
+    full = f"Subject: {subject}\n\n{body_t}"
+
+    try:
+        prediction, confidence, url_analysis, header_result = detector.predict(
+            full, headers=email.get("internetMessageHeaders"))
+        url_analysis, header_result = _make_serializable(url_analysis, header_result)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+    result = {
+        "idx": idx,
+        "prediction": _to_native(prediction),
+        "confidence": _to_native(confidence),
+        "url_analysis": url_analysis,
+        "header_result": header_result,
+    }
+    scan_results[idx] = result
+    _persist_scan_history(email, result)
+    return jsonify(result)
+
+
+@app.route("/api/scan-all", methods=["POST"])
+def scan_all_v2():
+    emails = _get_email_list()
+    if not detector.is_trained:
+        return jsonify({"error": "Model not loaded"}), 503
+    results = []
+    for i, email in enumerate(emails):
+        subject = email.get("subject", "") or ""
+        body_raw = email.get("body")
+        if isinstance(body_raw, dict):
+            body = body_raw.get("content", "") or ""
+        elif isinstance(body_raw, str):
+            body = body_raw
+        else:
+            body = email.get("bodyPreview", "") or ""
+        body_t = _html_to_text(body) if body else ""
+        full = f"Subject: {subject}\n\n{body_t}"
+        try:
+            prediction, confidence, url_analysis, header_result = detector.predict(
+                full, headers=email.get("internetMessageHeaders"))
+            url_analysis, header_result = _make_serializable(url_analysis, header_result)
+            result = {
+                "idx": i,
+                "prediction": int(prediction),
+                "confidence": float(confidence),
+                "url_analysis": url_analysis,
+                "header_result": header_result,
+            }
+            scan_results[i] = result
+            _persist_scan_history(email, result)
+            results.append(result)
+        except Exception:
+            pass
+    results_dict = {str(r["idx"]): r for r in results}
+    return jsonify({"results": results_dict})
+
+
+@app.route("/api/stats", methods=["GET"])
+def get_stats_v2():
+    scanned = len(scan_results)
+    threats = sum(1 for r in scan_results.values() if r.get("prediction") == 1)
+    safe = scanned - threats
+    return jsonify({
+        "scanned": scanned,
+        "threats": threats,
+        "safe": safe,
+        "total": len(_get_email_list()),
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Main
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    port = int(os.environ.get("FLASK_PORT", "5050"))
+    debug = os.environ.get("PHISHGUARD_DEBUG") == "1"
+    app.run(host="127.0.0.1", debug=debug, port=port, use_reloader=debug)
