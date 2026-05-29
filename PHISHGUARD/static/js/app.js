@@ -55,6 +55,79 @@ const SECURITY_TIPS = [
     'Tip: Watch for spelling and grammar mistakes in professional emails.'
 ];
 
+/* ======================== SUPABASE DATABASE AUTH ======================== */
+
+async function getSupabaseAuthHeaders(extraHeaders) {
+    const headers = Object.assign({}, extraHeaders || {});
+    try {
+        if (window.pg && window.pg.auth && window.pg.auth.currentSession) {
+            const session = await window.pg.auth.currentSession();
+            if (session && session.access_token) {
+                headers.Authorization = 'Bearer ' + session.access_token;
+            }
+        }
+    } catch (err) {
+        console.warn('Supabase session unavailable:', err);
+    }
+    return headers;
+}
+
+async function checkDatabaseStatus() {
+    const statusEl = document.getElementById('dbSyncStatus');
+    const btn = document.getElementById('dbSignInBtn');
+    if (!statusEl || !btn) return;
+
+    if (!window.pg || !window.pg.auth) {
+        statusEl.textContent = 'Supabase client not loaded';
+        btn.disabled = true;
+        return;
+    }
+
+    const headers = await getSupabaseAuthHeaders();
+    const res = await fetch('/api/db/status', { headers });
+    const data = await res.json();
+    const user = await window.pg.auth.currentUser();
+
+    if (!data.configured) {
+        statusEl.textContent = 'Supabase config needed';
+        btn.textContent = 'Configure Supabase';
+        btn.disabled = true;
+    } else if (user) {
+        statusEl.textContent = 'Database sync active: ' + (user.email || 'signed in');
+        btn.textContent = 'Sign Out of Database';
+        btn.disabled = false;
+    } else {
+        statusEl.textContent = 'Database sync not signed in';
+        btn.textContent = 'Sign In for Database Sync';
+        btn.disabled = false;
+    }
+}
+
+async function handleDatabaseSignIn() {
+    if (!window.pg || !window.pg.auth) {
+        setStatus('Supabase client not loaded', 'error');
+        return;
+    }
+
+    const user = await window.pg.auth.currentUser();
+    if (user) {
+        await window.pg.auth.signOut();
+        await checkDatabaseStatus();
+        setStatus('Database sync signed out');
+        return;
+    }
+
+    const { data, error } = await window.pg.auth.signInWithMicrosoft();
+    if (error) {
+        setStatus('Database sign-in failed: ' + error.message, 'error');
+        return;
+    }
+    if (data && data.url) {
+        window.open(data.url, 'supabaseAuth', 'width=600,height=700');
+        setStatus('Complete database sign-in in the popup');
+    }
+}
+
 /* ======================== UTILITY FUNCTIONS ======================== */
 
 function hashCode(str) {
@@ -204,7 +277,8 @@ async function loadEmails() {
 async function scanEmail(idx) {
     setStatus('Scanning email...', 'scanning');
     try {
-        const res = await fetch('/api/scan/' + idx, { method: 'POST' });
+        const headers = await getSupabaseAuthHeaders();
+        const res = await fetch('/api/scan/' + idx, { method: 'POST', headers });
         const data = await res.json();
         if (data.error) {
             console.error('Scan error:', data.error);
@@ -228,7 +302,8 @@ async function scanEmail(idx) {
 async function scanAll() {
     setStatus('Scanning all emails...', 'scanning');
     try {
-        const res = await fetch('/api/scan-all', { method: 'POST' });
+        const headers = await getSupabaseAuthHeaders();
+        const res = await fetch('/api/scan-all', { method: 'POST', headers });
         if (!res.ok) throw new Error('Scan all failed');
         const data = await res.json();
 
@@ -412,8 +487,8 @@ function showEmail(idx) {
     renderReputation(email);
     renderHeaders(email);
 
-    const bodyText = email.body || '';
     const bodyEl = document.getElementById('previewBody');
+    const bodyText = email.body || '';
     bodyEl.innerHTML = escapeHtml(bodyText).replace(/\n/g, '<br>');
 
     const scanBtn = document.getElementById('scanBtn');
@@ -473,7 +548,7 @@ async function renderReputation(email) {
 
     const repData = await getReputation(domain);
     if (repData && repData.score !== undefined) {
-        const score = Math.round(repData.score);
+        const score = Math.round(repData.score * 100);
         document.getElementById('repGaugeValue').textContent = score;
 
         let color, verdict, badgeClass, badgeText;
@@ -602,13 +677,13 @@ function renderRiskOverview(result, email) {
     if (urls.length > 0) {
         let riskyUrls = 0;
         for (const u of urls) {
-            if (u.risk === 'high' || u.risk === 'dangerous' || u.prediction === 'phishing' || u.is_phishing) {
+            if (u.risk === 'high' || u.is_phishing) {
                 riskyUrls++;
             }
         }
         linksScore = urls.length > 0 ? Math.round((riskyUrls / urls.length) * 100) : 0;
     } else {
-        linksScore = isPhishing ? 30 : 5;
+        linksScore = 0;
     }
 
     const headers = email.headers || {};
@@ -695,7 +770,7 @@ function renderWhyFlagged(isPhishing, result, email) {
         const urls = getUrlList(result);
         let riskyCount = 0;
         for (const u of urls) {
-            if (u.risk === 'high' || u.risk === 'dangerous' || u.prediction === 'phishing' || u.is_phishing) {
+            if (u.risk === 'high' || u.is_phishing) {
                 riskyCount++;
             }
         }
@@ -752,7 +827,7 @@ function renderWhyFlagged(isPhishing, result, email) {
         const urls = getUrlList(result);
         let allSafe = true;
         for (const u of urls) {
-            if (u.risk === 'high' || u.risk === 'dangerous' || u.prediction === 'phishing' || u.is_phishing) {
+            if (u.risk === 'high' || u.is_phishing) {
                 allSafe = false;
                 break;
             }
@@ -785,11 +860,11 @@ function renderLinkSafety(result) {
         const url = u.url || u.link || '';
         let riskLevel, riskClass, desc;
 
-        if (u.risk === 'high' || u.risk === 'dangerous' || u.prediction === 'phishing' || u.is_phishing) {
+        if (u.risk === 'high' || u.is_phishing) {
             riskLevel = 'Dangerous';
             riskClass = 'dangerous';
             desc = u.reason || 'This link shows characteristics commonly associated with phishing or malware distribution.';
-        } else if (u.risk === 'medium' || u.risk === 'suspicious') {
+        } else if (u.risk === 'medium') {
             riskLevel = 'Suspicious';
             riskClass = 'suspicious';
             desc = u.reason || 'This link has some unusual characteristics. Proceed with caution.';
@@ -943,6 +1018,7 @@ function loadPreferences() {
 function openSettings() {
     document.getElementById('settingsModal').style.display = 'flex';
     checkAuthStatus();
+    checkDatabaseStatus();
 }
 
 function closeSettings() {
@@ -1040,11 +1116,14 @@ async function connectOutlook() {
 
         // Poll for completion
         if (statusEl) statusEl.textContent = 'Waiting for sign-in...';
+        let pollDone = false;
         const pollInterval = setInterval(async () => {
+            if (pollDone) return;
             try {
                 const status = await fetch('/api/auth/status');
                 const statusData = await status.json();
                 if (statusData.connected) {
+                    pollDone = true;
                     clearInterval(pollInterval);
                     if (statusEl) statusEl.textContent = 'Connected as ' + (statusData.user_email || statusData.user_name);
                     setStatus('Connected as ' + (statusData.user_email || statusData.user_name));
@@ -1056,9 +1135,12 @@ async function connectOutlook() {
         }, 1500);
 
         setTimeout(() => {
-            clearInterval(pollInterval);
-            if (statusEl && statusEl.textContent === 'Waiting for sign-in...') {
-                statusEl.textContent = 'Timed out. Please try again.';
+            if (!pollDone) {
+                clearInterval(pollInterval);
+                pollDone = true;
+                if (statusEl && statusEl.textContent === 'Waiting for sign-in...') {
+                    statusEl.textContent = 'Timed out. Please try again.';
+                }
             }
         }, 120000);
 
@@ -1070,17 +1152,26 @@ async function connectOutlook() {
 
 async function refreshOutlookEmails() {
     try {
-        setStatus('Refreshing emails...');
+        setStatus('Refreshing emails...', 'scanning');
         const r = await fetch('/api/auth/refresh', { method: 'POST' });
         const data = await r.json();
         if (data.error) {
-            setStatus('Refresh failed: ' + data.error);
+            setStatus('Refresh failed: ' + data.error, 'error');
         } else {
-            await loadEmails();
-            setStatus('Loaded ' + data.count + ' emails');
+            /* Reload email list without clearing scan results or stats */
+            const res = await fetch('/api/emails');
+            if (res.ok) {
+                const emailData = await res.json();
+                state.emails = emailData.emails || [];
+                state.selectedIdx = null;
+                renderEmailList();
+                document.getElementById('emailPreview').style.display = 'none';
+                document.getElementById('dashboardView').style.display = '';
+            }
+            setStatus('Loaded ' + data.count + ' emails', '');
         }
     } catch (e) {
-        setStatus('Refresh error: ' + e.message);
+        setStatus('Refresh error: ' + e.message, 'error');
     }
 }
 
@@ -1174,6 +1265,10 @@ document.addEventListener('DOMContentLoaded', () => {
     /* Settings */
     document.getElementById('settingsBtn').addEventListener('click', openSettings);
     document.getElementById('settingsClose').addEventListener('click', closeSettings);
+    document.getElementById('dbSignInBtn').addEventListener('click', handleDatabaseSignIn);
+    if (window.pg && window.pg.auth && window.pg.auth.onChange) {
+        window.pg.auth.onChange(() => checkDatabaseStatus());
+    }
 
     /* Close modal on overlay click */
     document.getElementById('settingsModal').addEventListener('click', (e) => {
@@ -1209,6 +1304,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     /* Check auth status on load */
     checkAuthStatus();
+    checkDatabaseStatus();
 
     /* Keyboard: Escape to close modals */
     document.addEventListener('keydown', (e) => {
