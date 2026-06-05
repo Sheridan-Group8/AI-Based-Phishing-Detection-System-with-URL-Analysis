@@ -56,18 +56,19 @@ class URLAnalyzer:
         'locked', 'urgent', 'expire', 'billing', 'payment', 'wallet'
     }
 
-    # URL pattern to extract URLs from text
+    # URL pattern to extract URLs from text. Bounded character class and
+    # explicit length limit keep this linear-time even on adversarial bodies.
     URL_PATTERN = re.compile(
-        r'https?://[^\s<>"\']+|www\.[^\s<>"\']+',
+        r'https?://[^\s<>"\'`]{1,2048}|www\.[^\s<>"\'`]{1,2048}',
         re.IGNORECASE
     )
+    _MAX_TEXT_FOR_REGEX = 200_000
 
     def extract_urls(self, text):
-        """Extract all URLs from text."""
+        """Extract all URLs from text (ReDoS-safe, bounded work)."""
         if not text:
             return []
-        urls = self.URL_PATTERN.findall(str(text))
-        # Clean trailing punctuation
+        urls = self.URL_PATTERN.findall(str(text)[:self._MAX_TEXT_FOR_REGEX])
         cleaned = []
         for url in urls:
             url = url.rstrip('.,;:!?)>')
