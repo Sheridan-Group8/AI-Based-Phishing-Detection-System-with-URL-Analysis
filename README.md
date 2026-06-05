@@ -6,7 +6,7 @@
 
 ---
 
-## 👥 Team Members
+##  Team Members
 
 * Aarambha Adhikari
 * Arvind Balusu
