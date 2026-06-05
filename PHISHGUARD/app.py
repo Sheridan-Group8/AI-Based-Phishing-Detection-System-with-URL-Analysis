@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import socket
+import threading
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
@@ -428,6 +429,25 @@ def index():
     return send_from_directory("templates", "index.html")
 
 
+@app.route("/api/csrf", methods=["GET"])
+def get_csrf_token():
+    """Compatibility token for the Electron renderer's secure fetch wrapper."""
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return jsonify({"csrf": token})
+
+
+@app.route("/api/settings", methods=["GET"])
+def get_settings():
+    """Return minimal app settings expected by the newer renderer."""
+    return jsonify({
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_ANON_KEY),
+        "graph_connected": bool(_graph_token["access_token"] and _live_mode),
+    })
+
+
 @app.route("/api/log", methods=["GET"])
 def get_log():
     """Return the session log file contents."""
@@ -517,6 +537,10 @@ _live_emails = []  # emails fetched from real Outlook
 _pending_oauth = {}  # state -> {client_id, verifier, expires} — avoids session cookie issues in popup
 _OAUTH_TIMEOUT = timedelta(minutes=10)  # pending auth requests expire after 10 min
 _live_mode = False  # True when connected to real Outlook
+
+_external_oauth_lock = threading.Lock()
+_external_oauth_pending = {}
+_EXTERNAL_OAUTH_TTL_SECONDS = 600
 
 
 def _generate_pkce():
@@ -631,6 +655,238 @@ def auth_connect():
     }
     auth_url = f"{AUTHORITY}/oauth2/v2.0/authorize?{urlencode(params)}"
     return jsonify({"auth_url": auth_url})
+
+
+@app.route("/api/auth/external-start", methods=["POST"])
+def auth_external_start():
+    """Register the renderer nonce before browser-based Supabase OAuth."""
+    data = request.get_json(silent=True) or {}
+    nonce = str(data.get("nonce", "")).strip()
+    if not nonce or len(nonce) < 16 or len(nonce) > 128:
+        return jsonify({"error": "invalid nonce"}), 400
+
+    now = datetime.now()
+    with _external_oauth_lock:
+        stale = [
+            k for k, v in _external_oauth_pending.items()
+            if (now - v["created"]).total_seconds() > _EXTERNAL_OAUTH_TTL_SECONDS
+        ]
+        for k in stale:
+            _external_oauth_pending.pop(k, None)
+        if len(_external_oauth_pending) > 200:
+            return jsonify({"error": "too many pending"}), 429
+        _external_oauth_pending[nonce] = {"created": now, "tokens": None}
+    return jsonify({"ok": True})
+
+
+_EXTERNAL_CALLBACK_HTML = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>PhishGuard - Sign-in</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html,body { height: 100%; margin: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         background: #06060C; color: #F0F0F8; display: flex; align-items: center;
+         justify-content: center; padding: 24px; }
+  .box { max-width: 440px; text-align: center; }
+  h1 { font-size: 22px; margin: 0 0 14px; font-weight: 700; }
+  p { color: #B0B2CC; font-size: 14px; line-height: 1.55; margin: 8px 0; }
+  .spinner { margin: 32px auto 24px; width: 36px; height: 36px;
+             border: 3px solid rgba(129,140,248,0.18);
+             border-top-color: #818CF8; border-radius: 50%;
+             animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .ok { color: #34D399; font-weight: 600; }
+  .err { color: #FB7185; font-weight: 600; }
+  .small { color: #7B7D98; font-size: 12px; margin-top: 24px; }
+</style></head>
+<body>
+<div class="box">
+  <h1 id="title">Completing sign-in...</h1>
+  <div class="spinner" id="spinner"></div>
+  <p id="status">Securely transferring your session to PhishGuard.</p>
+  <p class="small">This window will close automatically.</p>
+</div>
+<script>
+(function () {
+  function escapeHtml(s) { return String(s).replace(/[<>"&]/g, ''); }
+  var hash = new URLSearchParams((window.location.hash || '').replace(/^#/, ''));
+  var query = new URLSearchParams(window.location.search || '');
+  var nonce = query.get('nonce');
+  var accessToken = hash.get('access_token');
+  var refreshToken = hash.get('refresh_token') || '';
+  var providerToken = hash.get('provider_token') || '';
+  var providerRefreshToken = hash.get('provider_refresh_token') || '';
+  var expiresIn = parseInt(hash.get('expires_in') || '3600', 10);
+  var err = hash.get('error') || query.get('error');
+  var errDesc = hash.get('error_description') || query.get('error_description');
+
+  var spinnerEl = document.getElementById('spinner');
+  var statusEl = document.getElementById('status');
+  var titleEl = document.getElementById('title');
+
+  function fail(msg) {
+    spinnerEl.style.display = 'none';
+    titleEl.textContent = 'Sign-in failed';
+    statusEl.innerHTML = '<span class="err">' + escapeHtml(msg) + '</span>';
+  }
+
+  if (err) { fail((errDesc || err) + ' - you can close this tab.'); return; }
+  if (!nonce || !accessToken) {
+    fail('Missing session data. You can close this tab and try again.');
+    return;
+  }
+
+  fetch('/api/auth/external-deliver', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      nonce: nonce,
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      provider_token: providerToken,
+      provider_refresh_token: providerRefreshToken,
+      expires_in: expiresIn,
+    }),
+  }).then(function (r) { return r.json(); })
+    .then(function (data) {
+      spinnerEl.style.display = 'none';
+      if (data && data.ok) {
+        titleEl.textContent = 'Signed in';
+        statusEl.innerHTML = '<span class="ok">You can close this tab and return to PhishGuard.</span>';
+        setTimeout(function () { try { window.close(); } catch (e) {} }, 1500);
+      } else {
+        fail((data && data.error) || 'Delivery failed.');
+      }
+    }).catch(function (e) { fail('Delivery failed: ' + e.message); });
+})();
+</script>
+</body></html>
+"""
+
+
+@app.route("/auth/external-callback")
+def auth_external_callback():
+    """Receive Supabase OAuth redirect and deliver URL hash tokens to Flask."""
+    return _EXTERNAL_CALLBACK_HTML
+
+
+@app.route("/api/auth/external-deliver", methods=["POST"])
+def auth_external_deliver():
+    """Browser callback page posts Supabase session tokens for Electron to poll."""
+    data = request.get_json(silent=True) or {}
+    nonce = str(data.get("nonce", "")).strip()
+    if not nonce:
+        return jsonify({"error": "nonce required"}), 400
+
+    access_token = str(data.get("access_token", "")).strip()
+    if not access_token:
+        return jsonify({"error": "missing access_token"}), 400
+
+    try:
+        expires_in = int(data.get("expires_in") or 3600)
+    except (TypeError, ValueError):
+        expires_in = 3600
+
+    with _external_oauth_lock:
+        entry = _external_oauth_pending.get(nonce)
+        if not entry:
+            return jsonify({"error": "unknown or expired nonce"}), 404
+        if entry.get("tokens"):
+            return jsonify({"error": "already delivered"}), 409
+        entry["tokens"] = {
+            "access_token": access_token,
+            "refresh_token": str(data.get("refresh_token", "")).strip(),
+            "provider_token": str(data.get("provider_token", "")).strip(),
+            "provider_refresh_token": str(data.get("provider_refresh_token", "")).strip(),
+            "expires_in": expires_in,
+        }
+        entry["delivered_at"] = datetime.now()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/auth/external-poll", methods=["GET"])
+def auth_external_poll():
+    """Return pending until browser OAuth delivers tokens, then return once."""
+    nonce = (request.args.get("nonce") or "").strip()
+    if not nonce:
+        return jsonify({"status": "invalid"}), 400
+
+    now = datetime.now()
+    with _external_oauth_lock:
+        entry = _external_oauth_pending.get(nonce)
+        if not entry:
+            return jsonify({"status": "expired"}), 404
+        if (now - entry["created"]).total_seconds() > _EXTERNAL_OAUTH_TTL_SECONDS:
+            _external_oauth_pending.pop(nonce, None)
+            return jsonify({"status": "expired"}), 404
+        if not entry.get("tokens"):
+            return jsonify({"status": "pending"})
+        tokens = entry["tokens"]
+        _external_oauth_pending.pop(nonce, None)
+    return jsonify({"status": "ready", **tokens})
+
+
+@app.route("/api/auth/supabase-provider", methods=["POST"])
+def auth_supabase_provider():
+    """Use Supabase's Microsoft provider token as the Graph token."""
+    global _graph_token, _live_emails, _live_mode
+
+    if http_requests is None:
+        return jsonify({"error": "requests library not installed"}), 500
+
+    data = request.get_json(silent=True) or {}
+    provider_token = (data.get("provider_token") or "").strip()
+    if not provider_token:
+        return jsonify({"error": "provider_token required"}), 400
+
+    try:
+        expires_in = int(data.get("expires_in") or 3600)
+    except (TypeError, ValueError):
+        expires_in = 3600
+
+    _graph_token = {
+        "access_token": provider_token,
+        "expiry": datetime.now() + timedelta(seconds=max(60, expires_in)),
+    }
+
+    user_hint = data.get("user") or {}
+    try:
+        user_info = _graph_request("me")
+        _graph_user["name"] = user_info.get("displayName") or user_hint.get("name") or "User"
+        _graph_user["email"] = (
+            user_info.get("mail")
+            or user_info.get("userPrincipalName")
+            or user_hint.get("email")
+            or ""
+        )
+    except Exception:
+        _graph_user["name"] = user_hint.get("name") or "Connected"
+        _graph_user["email"] = user_hint.get("email") or ""
+
+    try:
+        _live_emails = _fetch_all_emails()
+    except Exception as exc:
+        _live_emails = []
+        _live_mode = False
+        return jsonify({"error": f"Could not fetch Outlook emails: {exc}"}), 502
+
+    _live_mode = True
+    scan_results.clear()
+    _log_session_event("LOGIN", {
+        "User": _graph_user["name"],
+        "Email": _graph_user["email"],
+        "Emails Loaded": len(_live_emails),
+        "Source": "Supabase Microsoft provider",
+    })
+    return jsonify({
+        "ok": True,
+        "connected": True,
+        "count": len(_live_emails),
+        "user_name": _graph_user["name"],
+        "user_email": _graph_user["email"],
+    })
 
 
 @app.route("/auth/callback")
@@ -783,6 +1039,25 @@ def _get_email_list():
     return _live_emails if _live_mode else []
 
 
+def _message_key(email, idx):
+    """Return the stable key used by the current renderer."""
+    return str(email.get("id") or email.get("messageId") or idx)
+
+
+def _find_email_by_message_id(message_id):
+    """Find an email by Graph message id, falling back to numeric index strings."""
+    emails = _get_email_list()
+    target = str(message_id)
+    for idx, email in enumerate(emails):
+        if _message_key(email, idx) == target:
+            return idx, email
+    if target.isdigit():
+        idx = int(target)
+        if 0 <= idx < len(emails):
+            return idx, emails[idx]
+    return None, None
+
+
 def _parse_auth_headers(internet_headers):
     """Parse internetMessageHeaders list into {spf, dkim, dmarc}."""
     result = {"spf": "none", "dkim": "none", "dmarc": "none"}
@@ -802,6 +1077,8 @@ def _parse_auth_headers(internet_headers):
 
 def _normalize_email(email, idx):
     """Convert Graph API / mock email to flat format the frontend expects."""
+    message_id = _message_key(email, idx)
+
     # Extract sender info
     sender = email.get("from", {})
     if "emailAddress" in sender:
@@ -825,7 +1102,10 @@ def _normalize_email(email, idx):
     headers = _parse_auth_headers(email.get("internetMessageHeaders"))
 
     return {
+        "id": message_id,
+        "messageId": message_id,
         "idx": idx,
+        "folder": email.get("folder", "inbox"),
         "subject": email.get("subject", "(No Subject)"),
         "sender_name": sender_name,
         "sender": sender_addr,
@@ -836,8 +1116,8 @@ def _normalize_email(email, idx):
         "hasAttachments": email.get("hasAttachments", False),
         "attachments": email.get("attachments", []),
         "headers": headers,
-        "scanned": idx in scan_results,
-        "scanResult": scan_results.get(idx),
+        "scanned": message_id in scan_results or idx in scan_results,
+        "scanResult": scan_results.get(message_id) or scan_results.get(idx),
     }
 
 
@@ -854,6 +1134,79 @@ def get_email_v2(idx):
     if idx < 0 or idx >= len(emails):
         return jsonify({"error": "Email not found"}), 404
     return jsonify(_normalize_email(emails[idx], idx))
+
+
+@app.route("/api/emails/junk", methods=["GET"])
+def get_junk_emails():
+    """Junk folder support is not part of the restored backend yet."""
+    return jsonify({"emails": []})
+
+
+@app.route("/api/messages/<path:message_id>", methods=["GET"])
+def get_message(message_id):
+    idx, email = _find_email_by_message_id(message_id)
+    if email is None:
+        return jsonify({"error": "Email not found"}), 404
+    return jsonify(_normalize_email(email, idx))
+
+
+@app.route("/api/messages/<path:message_id>/headers", methods=["GET"])
+def get_message_headers(message_id):
+    idx, email = _find_email_by_message_id(message_id)
+    if email is None:
+        return jsonify({"error": "Email not found"}), 404
+
+    headers = email.get("internetMessageHeaders") or []
+    if not isinstance(headers, list):
+        headers = []
+    return jsonify({
+        "headers": headers[:100],
+        "count": len(headers),
+        "truncated": len(headers) > 100,
+    })
+
+
+@app.route("/api/messages/<path:message_id>/attachments/<path:attachment_id>/analyze", methods=["POST"])
+def analyze_message_attachment(message_id, attachment_id):
+    idx, email = _find_email_by_message_id(message_id)
+    if email is None:
+        return jsonify({"error": "Email not found"}), 404
+    return jsonify({
+        "attachment_id": attachment_id,
+        "analyzed": False,
+        "configured": False,
+        "message": "Attachment analysis is not enabled in the lightweight backend.",
+    })
+
+
+@app.route("/api/messages/<path:message_id>/move-to-junk", methods=["POST"])
+def move_message_to_junk(message_id):
+    idx, email = _find_email_by_message_id(message_id)
+    if email is None:
+        return jsonify({"error": "Email not found"}), 404
+    return jsonify({
+        "ok": False,
+        "old_id": _message_key(email, idx),
+        "new_id": _message_key(email, idx),
+        "message": "Move to junk is not enabled in the lightweight backend.",
+    }), 501
+
+
+@app.route("/api/auth/photo", methods=["GET"])
+def auth_photo():
+    """The original backend does not fetch profile photos."""
+    return "", 404
+
+
+@app.route("/api/sender-dna/<path:sender_addr>", methods=["GET"])
+def sender_dna(sender_addr):
+    """Minimal sender DNA response; full profiling can be restored later."""
+    return jsonify({
+        "sender": sender_addr,
+        "status": "unknown",
+        "profile": None,
+        "comparison": None,
+    })
 
 
 def _to_native(obj):
@@ -918,15 +1271,10 @@ def _persist_scan_history(email, result):
               f"[{resp.status_code}]: {resp.text[:200]}")
 
 
-@app.route("/api/scan/<int:idx>", methods=["POST"])
-def scan_email_v2(idx):
-    emails = _get_email_list()
-    if idx < 0 or idx >= len(emails):
-        return jsonify({"error": "Email not found"}), 404
+def _scan_email_common(email, idx):
     if not detector.is_trained:
-        return jsonify({"error": "Model not loaded"}), 503
+        return None, (jsonify({"error": "Model not loaded"}), 503)
 
-    email = emails[idx]
     subject = email.get("subject", "") or ""
     body_raw = email.get("body")
     if isinstance(body_raw, dict):
@@ -945,17 +1293,44 @@ def scan_email_v2(idx):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        return None, (jsonify({"error": str(e)}), 500)
 
+    message_id = _message_key(email, idx)
     result = {
+        "id": message_id,
+        "messageId": message_id,
         "idx": idx,
         "prediction": _to_native(prediction),
         "confidence": _to_native(confidence),
         "url_analysis": url_analysis,
         "header_result": header_result,
     }
-    scan_results[idx] = result
+    scan_results[message_id] = result
     _persist_scan_history(email, result)
+    return result, None
+
+
+@app.route("/api/scan/<int:idx>", methods=["POST"])
+def scan_email_v2(idx):
+    emails = _get_email_list()
+    if idx < 0 or idx >= len(emails):
+        return jsonify({"error": "Email not found"}), 404
+
+    result, error = _scan_email_common(emails[idx], idx)
+    if error:
+        return error
+    return jsonify(result)
+
+
+@app.route("/api/messages/<path:message_id>/scan", methods=["POST"])
+def scan_message(message_id):
+    idx, email = _find_email_by_message_id(message_id)
+    if email is None:
+        return jsonify({"error": "Email not found"}), 404
+
+    result, error = _scan_email_common(email, idx)
+    if error:
+        return error
     return jsonify(result)
 
 
@@ -980,14 +1355,17 @@ def scan_all_v2():
             prediction, confidence, url_analysis, header_result = detector.predict(
                 full, headers=email.get("internetMessageHeaders"))
             url_analysis, header_result = _make_serializable(url_analysis, header_result)
+            message_id = _message_key(email, i)
             result = {
+                "id": message_id,
+                "messageId": message_id,
                 "idx": i,
                 "prediction": int(prediction),
                 "confidence": float(confidence),
                 "url_analysis": url_analysis,
                 "header_result": header_result,
             }
-            scan_results[i] = result
+            scan_results[message_id] = result
             _persist_scan_history(email, result)
             results.append(result)
         except Exception:

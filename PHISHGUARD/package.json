@@ -1,12 +1,59 @@
 {
-  "name": "phishguard-basic-electron",
-  "version": "1.0.0",
-  "description": "Basic Electron shell for the PhishGuard Flask dashboard",
+  "name": "phishguard",
+  "version": "2.0.0",
+  "description": "PhishGuard — AI-powered phishing email detection",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "build": "electron-builder",
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux"
+  },
+  "build": {
+    "appId": "com.phishguard.app",
+    "productName": "PhishGuard",
+    "files": [
+      "main.js",
+      "preload.js",
+      "app.py",
+      "phishing_detector.py",
+      "phishing_model.pkl",
+      "static/**/*",
+      "templates/**/*",
+      "requirements.txt"
+    ],
+    "extraResources": [
+      {
+        "from": ".",
+        "to": "app",
+        "filter": [
+          "app.py",
+          "phishing_detector.py",
+          "phishing_model.pkl",
+          "static/**/*",
+          "templates/**/*",
+          "requirements.txt"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": null
+    },
+    "mac": {
+      "target": "dmg"
+    },
+    "linux": {
+      "target": "AppImage"
+    }
   },
   "devDependencies": {
-    "electron": "^41.7.1"
+    "electron": "^41.7.1",
+    "electron-builder": "^26.9.0"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.106.0",
+    "flask": "^0.2.10"
   }
 }

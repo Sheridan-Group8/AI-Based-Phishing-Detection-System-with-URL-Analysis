@@ -43,17 +43,18 @@ System architecture updated to Electron + Flask + Supabase
 UI/UX flow continues to be improved for the desktop dashboard
 
 ## Database Connection Note
-For now, database connection is handled from inside the app. Open PhishGuard, go to Settings, and connect to the database from there.
+Database and Outlook connection are now handled from the app sign-in flow. When PhishGuard opens, sign in with Microsoft once to enable Supabase database sync and load Outlook emails.
 
-This process is temporary. A future update will simplify the database connection flow so users do not need to manually connect through Settings.
-
-## Status: In Progress (On Track)
+This process will continue to be simplified as the login and onboarding flow is refined.
 
 ## In Progress
 ML/AI model accuracy improvements
 Login and authentication flow refinement
 URL and domain analysis enhancements
 User interface and dashboard usability improvements
+
+## Status: In Progress (On Track)
+
 
 
 ## This project is developed for academic purposes at Sheridan College.
