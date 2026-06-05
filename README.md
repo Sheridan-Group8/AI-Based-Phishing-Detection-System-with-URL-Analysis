@@ -224,15 +224,10 @@ Combined URL training data contains more than 108,000 labeled URLs.
 
 ### In Progress
 
-🔄 Dashboard UI/UX improvements
+🔄 Dashboard UI/UX enhancements
 
-🔄 Model performance optimization
+🔄 Model performance improvements
 
-🔄 Real-time email monitoring
-
-🔄 Expanded phishing dataset training
-
-🔄 Detection accuracy benchmarking
 
 ---
 
@@ -251,13 +246,11 @@ When PhishGuard launches:
 
 # Future Enhancements
 
-* Real-time Outlook monitoring
 * Attachment malware analysis
 * Sender reputation scoring
 * Threat intelligence integration
-* User feedback learning system
 * Advanced reporting and analytics
-* Cloud-based model updates
+
 
 ---
 
