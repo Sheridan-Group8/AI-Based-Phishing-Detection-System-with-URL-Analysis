@@ -1,55 +1,268 @@
-# AI-Based Phishing Detection System with URL Analysis
+# AI-Based Phishing Detection System with Dual-Model Analysis
 
-## Capstone Project – Sheridan College  
-**Group 8**  
-**Date:** 06 June, 2026  
-
-### 👥 Team Members
-- Aarambha Adhikari  
-- Arvind Balusu  
-- Aasiya Chauhan  
-- Muhammad Yahya Khan  
+**Capstone Project – Sheridan College**
+**Group 8**
+**Date:** 06 June 2026 (Week 5 in Phase 2)
 
 ---
 
-## Project Overview
-PhishGuard is a desktop-based cybersecurity application that detects phishing emails from Microsoft Outlook. It integrates Microsoft Graph API, machine learning models, URL analysis, and email header validation to classify emails and highlight potential security threats.
+## 👥 Team Members
 
-The project is currently in Phase 2 development, transitioning from a proof-of-concept system to a full desktop application with persistent database storage and improved detection accuracy.
+* Aarambha Adhikari
+* Arvind Balusu
+* Aasiya Chauhan
+* Muhammad Yahya Khan
 
+---
 
-## Problem Statement
+# Project Overview
 
-Phishing emails are one of the most common cybersecurity threats, often bypassing basic email filters and targeting users through deceptive links and spoofed sender identities. Existing email clients provide limited deep analysis of URLs, sender behavior, and email structure, making users vulnerable to attacks.
+PhishGuard is an AI-powered desktop cybersecurity application designed to detect phishing emails from Microsoft Outlook. The system combines machine learning, URL intelligence, email authentication analysis, and Microsoft Graph integration to provide comprehensive phishing detection and risk assessment.
 
+The platform analyzes email content, embedded URLs, sender authenticity, and email structure to identify malicious messages that may bypass traditional spam filters.
 
-## Proposed Solution
+PhishGuard is currently in Phase 2 development, evolving from a proof-of-concept into a full-featured desktop application built with Electron, Flask, Supabase, and advanced machine learning models.
 
-PhishGuard addresses this issue by providing an intelligent phishing detection system that:
+---
 
-Analyzes email content using machine learning models
-Inspects URLs using lexical and domain-based features
-Validates email authenticity using SPF, DKIM, and DMARC checks
-Stores scan history and sender data in a structured database
-Presents results through a clear desktop dashboard for user action
+# Problem Statement
 
-## Current Status (Week 4 – Phase 2)
-Database schema designed and implemented in Supabase
-Tables created for scan history, sender data, and logs
-Supabase database connection added to the PhishGuard dashboard
-Existing dashboard integrated into a basic Electron desktop window
-Local Electron startup tested with Flask backend running on localhost
-System architecture updated to Electron + Flask + Supabase
-UI/UX flow continues to be improved for the desktop dashboard
+Phishing attacks remain one of the most common and effective cyber threats. Attackers frequently impersonate trusted organizations and use deceptive emails, malicious links, and spoofed sender identities to steal credentials and sensitive information.
 
-## Database Connection Note
-Database and Outlook connection are now handled from the app sign-in flow. When PhishGuard opens, sign in with Microsoft once to enable Supabase database sync and load Outlook emails.
+Traditional email filtering solutions often rely on signature-based detection and may fail to identify sophisticated phishing campaigns. Users therefore require additional protection that analyzes email content, URLs, authentication records, and behavioral indicators before interacting with suspicious messages.
 
-## Status: In Progress (On Track)
+---
 
-## In Progress
-ML/AI model accuracy improvements
-URL and domain analysis enhancements
+# Proposed Solution
 
+PhishGuard provides a multi-layered phishing detection framework that:
 
-## This project is developed for academic purposes at Sheridan College.
+* Detects phishing emails using machine learning models
+* Analyzes embedded URLs for phishing indicators
+* Identifies brand impersonation attempts
+* Detects suspicious domains, shortened URLs, and IP-based links
+* Validates sender authenticity using SPF, DKIM, and DMARC
+* Evaluates structural and behavioral characteristics of emails
+* Stores scan history and security events in Supabase
+* Integrates directly with Microsoft Outlook using Microsoft Graph API
+* Presents results through an intuitive desktop dashboard
+
+---
+
+# Detection Architecture
+
+## Text Analysis Model
+
+The primary email classifier uses:
+
+* TF-IDF Vectorization (10,000 features)
+* Unigrams and Bigrams
+* Multinomial Naive Bayes Classification
+* Structural Email Feature Analysis
+
+### Structural Features
+
+The system evaluates:
+
+* Capitalization ratio
+* Exclamation density
+* Question mark density
+* Urgency language
+* Financial/reward terminology
+* Threat-related wording
+* Email length
+* Line count
+* Special character density
+* Numeric content ratio
+* HTML presence
+* Link-to-text ratio
+
+---
+
+## URL Intelligence Model
+
+A dedicated URL classifier independently analyzes URLs extracted from emails.
+
+### URL Risk Indicators
+
+The system detects:
+
+* Suspicious top-level domains (.xyz, .top, .click, etc.)
+* URL shorteners
+* Brand impersonation
+* IP-address-based URLs
+* Suspicious keywords
+* Excessive subdomains
+* Non-standard ports
+* Redirect manipulation techniques
+* Long and obfuscated URLs
+
+### URL Classification
+
+* Logistic Regression Model
+* Trained on 108,000+ phishing and legitimate URLs
+* Separate from the email content classifier
+* Combined with text classification during final scoring
+
+---
+
+## Email Authentication Analysis
+
+PhishGuard validates sender authenticity using:
+
+### SPF (Sender Policy Framework)
+
+Verifies whether the sender is authorized to send email on behalf of the domain.
+
+### DKIM (DomainKeys Identified Mail)
+
+Validates cryptographic signatures attached to emails.
+
+### DMARC (Domain-based Message Authentication, Reporting & Conformance)
+
+Ensures alignment between SPF and DKIM validation results.
+
+Authentication results are incorporated into the final phishing confidence score.
+
+---
+
+# Dual-Model Scoring System
+
+PhishGuard uses a weighted scoring approach:
+
+Final Risk Score =
+
+* 55% Text Model Score
+* 45% URL Model Score
+
+Authentication results from SPF, DKIM, and DMARC can increase or decrease the final risk assessment.
+
+This layered approach improves detection accuracy and reduces false positives compared to relying solely on email text analysis.
+
+---
+
+# Training Datasets
+
+The phishing detection models are trained using multiple publicly available datasets.
+
+### Email Datasets
+
+* Kaggle Phishing Email Dataset
+* Hugging Face Phishing Email Dataset
+* CybersecTony PhishingEmailDetection v2.0
+
+### URL Datasets
+
+* CybersecTony PhishingEmailDetection v2.0 URL Dataset
+* Shawhin Phishing Site Classification Dataset
+
+Combined URL training data contains more than 108,000 labeled URLs.
+
+---
+
+# Technology Stack
+
+## Frontend
+
+* Electron
+* HTML
+* CSS
+* JavaScript
+
+## Backend
+
+* Flask (Python)
+
+## Database
+
+* Supabase
+
+## Microsoft Integration
+
+* Microsoft Graph API
+* Outlook Mail Access
+* Microsoft Authentication
+
+## Machine Learning
+
+* Scikit-Learn
+* TF-IDF Vectorization
+* Multinomial Naive Bayes
+* Logistic Regression
+* NumPy
+* Pandas
+
+---
+
+# Current Development Status (Week 5 – Phase 2)
+
+### Completed
+
+✓ Electron desktop application integration
+
+✓ Flask backend integration
+
+✓ Supabase database implementation
+
+✓ Microsoft Graph API integration
+
+✓ Outlook email retrieval
+
+✓ Dual-model phishing detection architecture
+
+✓ Advanced URL intelligence engine
+
+✓ SPF/DKIM/DMARC validation module
+
+✓ Structural email analysis module
+
+✓ Persistent scan history storage
+
+✓ Enhanced phishing confidence scoring
+
+---
+
+### In Progress
+
+🔄 Dashboard UI/UX improvements
+
+🔄 Model performance optimization
+
+🔄 Real-time email monitoring
+
+🔄 Expanded phishing dataset training
+
+🔄 Detection accuracy benchmarking
+
+---
+
+# Database Connection Note
+
+Database synchronization and Outlook access are handled through the Microsoft sign-in flow.
+
+When PhishGuard launches:
+
+1. Sign in with your Microsoft account.
+2. Outlook emails are retrieved through Microsoft Graph.
+3. Scan history is synchronized with Supabase.
+4. Phishing analysis results become available in the dashboard.
+
+---
+
+# Future Enhancements
+
+* Real-time Outlook monitoring
+* Attachment malware analysis
+* Sender reputation scoring
+* Threat intelligence integration
+* User feedback learning system
+* Advanced reporting and analytics
+* Cloud-based model updates
+
+---
+
+# Project Status
+
+**Status:** Active Development (On Track)
+
+This project is being developed for academic purposes as part of the Sheridan College Capstone Project.
