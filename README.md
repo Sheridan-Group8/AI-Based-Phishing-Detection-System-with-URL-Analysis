@@ -2,7 +2,7 @@
 
 ## Capstone Project – Sheridan College  
 **Group 8**  
-**Date:** 21 May, 2026  
+**Date:** 06 June, 2026  
 
 ### 👥 Team Members
 - Aarambha Adhikari  
@@ -45,16 +45,11 @@ UI/UX flow continues to be improved for the desktop dashboard
 ## Database Connection Note
 Database and Outlook connection are now handled from the app sign-in flow. When PhishGuard opens, sign in with Microsoft once to enable Supabase database sync and load Outlook emails.
 
-This process will continue to be simplified as the login and onboarding flow is refined.
+## Status: In Progress (On Track)
 
 ## In Progress
 ML/AI model accuracy improvements
-Login and authentication flow refinement
 URL and domain analysis enhancements
-User interface and dashboard usability improvements
-
-## Status: In Progress (On Track)
-
 
 
 ## This project is developed for academic purposes at Sheridan College.
