@@ -137,9 +137,89 @@ except Exception as e:
     print(f"WARNING: Could not load model: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Server-side scan results cache
+#  Per-session server-side state
+#
+#  Mailbox/OAuth state is keyed by a server-generated session ID carried in an
+#  HttpOnly, SameSite=Strict cookie. This prevents two renderer/browser clients
+#  from sharing the same Outlook token, email list, and scan results.
 # ─────────────────────────────────────────────────────────────────────────────
-scan_results = {}
+SESSION_COOKIE = "pg_sid"
+SESSION_IDLE_TTL = timedelta(hours=8)
+_SCAN_ALL_COOLDOWN = 30
+
+
+class SessionState:
+    """Per-browser/Electron-window mailbox and auth state."""
+
+    __slots__ = (
+        "sid", "created", "last_seen", "csrf_token",
+        "graph_token", "graph_user", "live_emails", "junk_emails",
+        "live_mode", "scan_results", "_last_scan_all",
+        "_scan_all_in_flight",
+    )
+
+    def __init__(self, sid):
+        self.sid = sid
+        self.created = datetime.now()
+        self.last_seen = self.created
+        self.csrf_token = secrets.token_urlsafe(32)
+        self.graph_token = {"access_token": None, "expiry": None}
+        self.graph_user = {"name": "", "email": ""}
+        self.live_emails = []
+        self.junk_emails = []
+        self.live_mode = False
+        self.scan_results = {}
+        self._last_scan_all = None
+        self._scan_all_in_flight = False
+
+
+_sessions = {}
+_sessions_lock = threading.Lock()
+
+
+def _get_or_create_session():
+    sid = request.cookies.get(SESSION_COOKIE)
+    needs_new_cookie = False
+    now = datetime.now()
+    with _sessions_lock:
+        stale = [
+            key for key, value in _sessions.items()
+            if now - value.last_seen > SESSION_IDLE_TTL
+        ]
+        for key in stale:
+            _sessions.pop(key, None)
+
+        sess = _sessions.get(sid) if sid else None
+        if sess is None:
+            sid = secrets.token_urlsafe(32)
+            sess = SessionState(sid)
+            _sessions[sid] = sess
+            needs_new_cookie = True
+        sess.last_seen = now
+
+    request.environ["phishguard.session"] = sess
+    request.environ["phishguard.sid"] = sid
+    request.environ["phishguard.set_cookie"] = needs_new_cookie
+    return sess
+
+
+def _current_session():
+    return request.environ.get("phishguard.session") or _get_or_create_session()
+
+
+@app.after_request
+def _emit_session_cookie(resp):
+    sid = request.environ.get("phishguard.sid")
+    if sid and request.environ.get("phishguard.set_cookie"):
+        resp.set_cookie(
+            SESSION_COOKIE,
+            sid,
+            httponly=True,
+            samesite="Strict",
+            secure=False,
+            max_age=int(SESSION_IDLE_TTL.total_seconds()),
+        )
+    return resp
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Session Log
@@ -929,19 +1009,17 @@ def index():
 @app.route("/api/csrf", methods=["GET"])
 def get_csrf_token():
     """Compatibility token for the Electron renderer's secure fetch wrapper."""
-    token = session.get("csrf_token")
-    if not token:
-        token = secrets.token_urlsafe(32)
-        session["csrf_token"] = token
-    return jsonify({"csrf": token})
+    sess = _current_session()
+    return jsonify({"csrf": sess.csrf_token})
 
 
 @app.route("/api/settings", methods=["GET"])
 def get_settings():
     """Return minimal app settings expected by the newer renderer."""
+    sess = _current_session()
     return jsonify({
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_ANON_KEY),
-        "graph_connected": bool(_graph_token["access_token"] and _live_mode),
+        "graph_connected": bool(sess.graph_token["access_token"] and sess.live_mode),
     })
 
 
@@ -1043,13 +1121,11 @@ GRAPH_URL = "https://graph.microsoft.com/v1.0"
 SCOPES = ["Mail.Read", "User.Read"]
 REDIRECT_URI = "http://localhost:5050/auth/callback"
 
-# Server-side state for the authenticated session
-_graph_token = {"access_token": None, "expiry": None}
-_graph_user = {"name": "", "email": ""}  # user info — stored server-side, not in session
-_live_emails = []  # emails fetched from real Outlook
-_pending_oauth = {}  # state -> {client_id, verifier, expires} — avoids session cookie issues in popup
+# Pending OAuth requests are process-wide because the Microsoft callback popup
+# may not carry the renderer's session cookie. Each entry stores the sid that
+# initiated the flow so the callback can populate the correct SessionState.
+_pending_oauth = {}  # state -> {client_id, verifier, expires, sid}
 _OAUTH_TIMEOUT = timedelta(minutes=10)  # pending auth requests expire after 10 min
-_live_mode = False  # True when connected to real Outlook
 
 _external_oauth_lock = threading.Lock()
 _external_oauth_pending = {}
@@ -1063,27 +1139,31 @@ def _generate_pkce():
     return verifier, challenge
 
 
-def _graph_request(endpoint, params=None):
-    if not _graph_token["access_token"]:
+def _graph_request(sess, endpoint, params=None):
+    token = sess.graph_token
+    if not token["access_token"]:
         raise ValueError("Not authenticated")
-    if _graph_token["expiry"] and datetime.now() >= _graph_token["expiry"]:
-        _graph_token["access_token"] = None
-        _graph_token["expiry"] = None
+    if token["expiry"] and datetime.now() >= token["expiry"]:
+        token["access_token"] = None
+        token["expiry"] = None
         raise ValueError("Token expired")
     headers = {
-        "Authorization": f"Bearer {_graph_token['access_token']}",
+        "Authorization": f"Bearer {token['access_token']}",
         "Content-Type": "application/json",
     }
-    r = http_requests.get(f"{GRAPH_URL}/{endpoint}", headers=headers, params=params)
+    r = http_requests.get(
+        f"{GRAPH_URL}/{endpoint}", headers=headers, params=params,
+        timeout=HTTP_TIMEOUT,
+    )
     if r.status_code == 401:
-        _graph_token["access_token"] = None
-        _graph_token["expiry"] = None
+        token["access_token"] = None
+        token["expiry"] = None
         raise ValueError("Token expired")
     r.raise_for_status()
     return r.json()
 
 
-def _fetch_all_emails():
+def _fetch_all_emails(sess):
     """Fetch all inbox emails via pagination."""
     all_emails = []
     params = {
@@ -1091,20 +1171,21 @@ def _fetch_all_emails():
         "$select": "id,subject,from,receivedDateTime,bodyPreview,body,isRead,internetMessageHeaders,hasAttachments",
         "$orderby": "receivedDateTime desc",
     }
-    result = _graph_request("me/mailFolders/inbox/messages", params)
+    result = _graph_request(sess, "me/mailFolders/inbox/messages", params)
     all_emails.extend(result.get("value", []))
 
     # Follow @odata.nextLink until no more pages
     next_link = result.get("@odata.nextLink")
     while next_link:
+        token = sess.graph_token
         headers = {
-            "Authorization": f"Bearer {_graph_token['access_token']}",
+            "Authorization": f"Bearer {token['access_token']}",
             "Content-Type": "application/json",
         }
-        r = http_requests.get(next_link, headers=headers)
+        r = http_requests.get(next_link, headers=headers, timeout=HTTP_TIMEOUT)
         if r.status_code == 401:
-            _graph_token["access_token"] = None
-            _graph_token["expiry"] = None
+            token["access_token"] = None
+            token["expiry"] = None
             raise ValueError("Token expired")
         r.raise_for_status()
         data = r.json()
@@ -1119,19 +1200,20 @@ def _fetch_all_emails():
 @app.route("/api/auth/status", methods=["GET"])
 def auth_status():
     """Return current connection status."""
-    connected = bool(_graph_token["access_token"] and _live_mode)
+    sess = _current_session()
+    connected = bool(sess.graph_token["access_token"] and sess.live_mode)
     return jsonify({
         "connected": connected,
-        "live_mode": _live_mode,
-        "user_name": _graph_user["name"],
-        "user_email": _graph_user["email"],
+        "live_mode": sess.live_mode,
+        "user_name": sess.graph_user["name"],
+        "user_email": sess.graph_user["email"],
     })
 
 
 @app.route("/api/auth/connect", methods=["POST"])
 def auth_connect():
     """Start OAuth flow — returns the Microsoft login URL."""
-    global _live_mode
+    sess = _current_session()
     if http_requests is None:
         return jsonify({"error": "requests library not installed"}), 500
 
@@ -1154,6 +1236,7 @@ def auth_connect():
         "client_id": client_id,
         "verifier": verifier,
         "expires": now + _OAUTH_TIMEOUT,
+        "sid": sess.sid,
     }
 
     params = {
@@ -1344,7 +1427,7 @@ def auth_external_poll():
 @app.route("/api/auth/supabase-provider", methods=["POST"])
 def auth_supabase_provider():
     """Use Supabase's Microsoft provider token as the Graph token."""
-    global _graph_token, _live_emails, _live_mode
+    sess = _current_session()
 
     if http_requests is None:
         return jsonify({"error": "requests library not installed"}), 500
@@ -1359,54 +1442,52 @@ def auth_supabase_provider():
     except (TypeError, ValueError):
         expires_in = 3600
 
-    _graph_token = {
+    sess.graph_token = {
         "access_token": provider_token,
         "expiry": datetime.now() + timedelta(seconds=max(60, expires_in)),
     }
 
     user_hint = data.get("user") or {}
     try:
-        user_info = _graph_request("me")
-        _graph_user["name"] = user_info.get("displayName") or user_hint.get("name") or "User"
-        _graph_user["email"] = (
+        user_info = _graph_request(sess, "me")
+        sess.graph_user["name"] = user_info.get("displayName") or user_hint.get("name") or "User"
+        sess.graph_user["email"] = (
             user_info.get("mail")
             or user_info.get("userPrincipalName")
             or user_hint.get("email")
             or ""
         )
     except Exception:
-        _graph_user["name"] = user_hint.get("name") or "Connected"
-        _graph_user["email"] = user_hint.get("email") or ""
+        sess.graph_user["name"] = user_hint.get("name") or "Connected"
+        sess.graph_user["email"] = user_hint.get("email") or ""
 
     try:
-        _live_emails = _fetch_all_emails()
+        sess.live_emails = _fetch_all_emails(sess)
     except Exception as exc:
-        _live_emails = []
-        _live_mode = False
+        sess.live_emails = []
+        sess.live_mode = False
         return jsonify({"error": f"Could not fetch Outlook emails: {exc}"}), 502
 
-    _live_mode = True
-    scan_results.clear()
+    sess.live_mode = True
+    sess.scan_results.clear()
     _log_session_event("LOGIN", {
-        "User": _graph_user["name"],
-        "Email": _graph_user["email"],
-        "Emails Loaded": len(_live_emails),
+        "User": sess.graph_user["name"],
+        "Email": sess.graph_user["email"],
+        "Emails Loaded": len(sess.live_emails),
         "Source": "Supabase Microsoft provider",
     })
     return jsonify({
         "ok": True,
         "connected": True,
-        "count": len(_live_emails),
-        "user_name": _graph_user["name"],
-        "user_email": _graph_user["email"],
+        "count": len(sess.live_emails),
+        "user_name": sess.graph_user["name"],
+        "user_email": sess.graph_user["email"],
     })
 
 
 @app.route("/auth/callback")
 def auth_callback():
     """Handle Microsoft OAuth redirect callback."""
-    global _graph_token, _live_emails, _live_mode
-
     error = request.args.get("error")
     if error:
         desc = request.args.get("error_description", error)
@@ -1420,6 +1501,13 @@ def auth_callback():
         return f"""<html><body style="font-family:system-ui;text-align:center;padding:60px">
         <h2>Error</h2><p>Invalid or expired state parameter.</p>
         <p>You can close this tab.</p></body></html>"""
+
+    with _sessions_lock:
+        sess = _sessions.get(pending.get("sid"))
+    if not sess:
+        return f"""<html><body style="font-family:system-ui;text-align:center;padding:60px">
+        <h2>Error</h2><p>The original PhishGuard session expired.</p>
+        <p>You can close this tab and try signing in again.</p></body></html>"""
 
     code = request.args.get("code")
     if not code:
@@ -1454,39 +1542,39 @@ def auth_callback():
         access_token = tokens.get("access_token")
         expires_in = int(tokens.get("expires_in", 3600))
 
-        # Temporarily set token so _graph_request works, but don't expose
-        # to the poll yet (poll checks _graph_token to decide "connected")
-        _graph_token["access_token"] = access_token
-        _graph_token["expiry"] = datetime.now() + timedelta(seconds=expires_in)
+        # Temporarily set token so _graph_request works, then load mail before
+        # marking this session connected.
+        sess.graph_token["access_token"] = access_token
+        sess.graph_token["expiry"] = datetime.now() + timedelta(seconds=expires_in)
 
         # Get user info
         try:
-            user_info = _graph_request("me")
-            _graph_user["name"] = user_info.get("displayName", "User")
-            _graph_user["email"] = user_info.get("mail") or user_info.get("userPrincipalName", "")
+            user_info = _graph_request(sess, "me")
+            sess.graph_user["name"] = user_info.get("displayName", "User")
+            sess.graph_user["email"] = user_info.get("mail") or user_info.get("userPrincipalName", "")
         except Exception:
-            _graph_user["name"] = "Connected"
-            _graph_user["email"] = ""
+            sess.graph_user["name"] = "Connected"
+            sess.graph_user["email"] = ""
 
         # Fetch emails before marking live mode — prevents race where
         # the main window poll sees "connected" but emails aren't loaded yet
         try:
-            _live_emails = _fetch_all_emails()
+            sess.live_emails = _fetch_all_emails(sess)
         except Exception as e:
-            _live_emails = []
+            sess.live_emails = []
 
         # Now mark live — the poll will see "connected" and loadEmails()
         # will return the real emails
-        _live_mode = True
+        sess.live_mode = True
 
         # Clear any previous scan results
-        scan_results.clear()
+        sess.scan_results.clear()
 
         # Log the login
         _log_session_event("LOGIN", {
-            "User": _graph_user["name"],
-            "Email": _graph_user["email"],
-            "Emails Loaded": len(_live_emails),
+            "User": sess.graph_user["name"],
+            "Email": sess.graph_user["email"],
+            "Emails Loaded": len(sess.live_emails),
         })
 
     except Exception as e:
@@ -1496,7 +1584,7 @@ def auth_callback():
 
     return f"""<html><body style="font-family:system-ui;text-align:center;padding:60px">
     <h2>Connected to Outlook</h2>
-    <p>Signed in as {_graph_user['name'] or 'User'}</p>
+    <p>Signed in as {sess.graph_user['name'] or 'User'}</p>
     <p>You can close this tab and return to PhishGuard.</p>
     <script>window.close();</script></body></html>"""
 
@@ -1504,52 +1592,58 @@ def auth_callback():
 @app.route("/api/auth/disconnect", methods=["POST"])
 def auth_disconnect():
     """Disconnect from Outlook and log session summary."""
-    global _graph_token, _live_emails, _live_mode
+    sess = _current_session()
 
     # Compute scan stats before clearing
-    total_emails = len(_live_emails)
-    total_scanned = len(scan_results)
-    threats = sum(1 for r in scan_results.values() if r.get("prediction") == 1)
+    total_emails = len(sess.live_emails)
+    total_scanned = len(sess.scan_results)
+    threats = sum(1 for r in sess.scan_results.values() if r.get("prediction") == 1)
     safe = total_scanned - threats
 
     _log_session_event("LOGOUT", {
-        "User": _graph_user["name"],
-        "Email": _graph_user["email"],
+        "User": sess.graph_user["name"],
+        "Email": sess.graph_user["email"],
         "Total Emails": total_emails,
         "Emails Scanned": total_scanned,
         "Phishing Detected": threats,
         "Safe Emails": safe,
     })
 
-    _graph_token = {"access_token": None, "expiry": None}
-    _graph_user["name"] = ""
-    _graph_user["email"] = ""
-    _live_emails = []
-    _live_mode = False
-    scan_results.clear()
-    _pending_oauth.clear()
+    sess.graph_token = {"access_token": None, "expiry": None}
+    sess.graph_user["name"] = ""
+    sess.graph_user["email"] = ""
+    sess.live_emails = []
+    sess.junk_emails = []
+    sess.live_mode = False
+    sess.scan_results.clear()
+    for state, pending in list(_pending_oauth.items()):
+        if pending.get("sid") == sess.sid:
+            _pending_oauth.pop(state, None)
     return jsonify({"ok": True})
 
 
 @app.route("/api/auth/refresh", methods=["POST"])
 def auth_refresh_emails():
     """Re-fetch emails from Outlook."""
-    global _live_emails
-    if not _live_mode or not _graph_token["access_token"]:
+    sess = _current_session()
+    if not sess.live_mode or not sess.graph_token["access_token"]:
         return jsonify({"error": "Not connected"}), 401
     try:
-        _live_emails = _fetch_all_emails()
-        scan_results.clear()
-        return jsonify({"count": len(_live_emails)})
+        sess.live_emails = _fetch_all_emails(sess)
+        sess.scan_results.clear()
+        return jsonify({"count": len(sess.live_emails)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 # ── Patch email endpoints to support live mode ───────────────────────────────
 
-def _get_email_list():
+def _get_email_list(sess=None, folder="inbox"):
     """Return the active email list (live emails when connected, empty otherwise)."""
-    return _live_emails if _live_mode else []
+    sess = sess or _current_session()
+    if folder == "junk":
+        return sess.junk_emails
+    return sess.live_emails if sess.live_mode else []
 
 
 def _message_key(email, idx):
@@ -1557,17 +1651,16 @@ def _message_key(email, idx):
     return str(email.get("id") or email.get("messageId") or idx)
 
 
-def _find_email_by_message_id(message_id):
-    """Find an email by Graph message id, falling back to numeric index strings."""
-    emails = _get_email_list()
+def _find_email_by_message_id(message_id, sess=None, folder=None):
+    """Find an email by stable message id in this session."""
+    sess = sess or _current_session()
     target = str(message_id)
-    for idx, email in enumerate(emails):
-        if _message_key(email, idx) == target:
-            return idx, email
-    if target.isdigit():
-        idx = int(target)
-        if 0 <= idx < len(emails):
-            return idx, emails[idx]
+    folders = ["inbox", "junk"] if folder is None else [folder]
+    for folder_key in folders:
+        emails = _get_email_list(sess, folder_key)
+        for idx, email in enumerate(emails):
+            if _message_key(email, idx) == target:
+                return idx, email
     return None, None
 
 
@@ -1588,7 +1681,7 @@ def _parse_auth_headers(internet_headers):
     return result
 
 
-def _normalize_email(email, idx):
+def _normalize_email(sess, email, idx):
     """Convert Graph API / mock email to flat format the frontend expects."""
     message_id = _message_key(email, idx)
 
@@ -1629,43 +1722,49 @@ def _normalize_email(email, idx):
         "hasAttachments": email.get("hasAttachments", False),
         "attachments": email.get("attachments", []),
         "headers": headers,
-        "scanned": message_id in scan_results or idx in scan_results,
-        "scanResult": scan_results.get(message_id) or scan_results.get(idx),
+        "scanned": message_id in sess.scan_results,
+        "scanResult": sess.scan_results.get(message_id),
     }
 
 
 @app.route("/api/emails", methods=["GET"])
 def get_emails_v2():
-    emails = _get_email_list()
-    emails_summary = [_normalize_email(email, i) for i, email in enumerate(emails)]
-    return jsonify({"emails": emails_summary})
-
-
-@app.route("/api/emails/<int:idx>", methods=["GET"])
-def get_email_v2(idx):
-    emails = _get_email_list()
-    if idx < 0 or idx >= len(emails):
-        return jsonify({"error": "Email not found"}), 404
-    return jsonify(_normalize_email(emails[idx], idx))
+    sess = _current_session()
+    folder = (request.args.get("folder") or "inbox").lower()
+    if folder not in ("inbox", "junk"):
+        return jsonify({"error": "Unknown folder"}), 400
+    emails = _get_email_list(sess, folder)
+    emails_summary = [
+        _normalize_email(sess, email, i) for i, email in enumerate(emails)
+    ]
+    return jsonify({"emails": emails_summary, "folder": folder})
 
 
 @app.route("/api/emails/junk", methods=["GET"])
 def get_junk_emails():
-    """Junk folder support is not part of the restored backend yet."""
-    return jsonify({"emails": []})
+    sess = _current_session()
+    emails = _get_email_list(sess, "junk")
+    return jsonify({
+        "emails": [_normalize_email(sess, email, i) for i, email in enumerate(emails)],
+        "folder": "junk",
+    })
 
 
 @app.route("/api/messages/<path:message_id>", methods=["GET"])
 def get_message(message_id):
-    idx, email = _find_email_by_message_id(message_id)
+    sess = _current_session()
+    folder = request.args.get("folder")
+    idx, email = _find_email_by_message_id(message_id, sess, folder)
     if email is None:
         return jsonify({"error": "Email not found"}), 404
-    return jsonify(_normalize_email(email, idx))
+    return jsonify(_normalize_email(sess, email, idx))
 
 
 @app.route("/api/messages/<path:message_id>/headers", methods=["GET"])
 def get_message_headers(message_id):
-    idx, email = _find_email_by_message_id(message_id)
+    sess = _current_session()
+    folder = request.args.get("folder")
+    idx, email = _find_email_by_message_id(message_id, sess, folder)
     if email is None:
         return jsonify({"error": "Email not found"}), 404
 
@@ -1679,22 +1778,23 @@ def get_message_headers(message_id):
     })
 
 
-def _fetch_attachment_bytes(message_id, attachment_id):
+def _fetch_attachment_bytes(sess, message_id, attachment_id):
     """Fetch Outlook attachment bytes for local hash-based analysis."""
-    if not _live_mode or not _graph_token["access_token"] or not http_requests:
+    token = sess.graph_token
+    if not sess.live_mode or not token["access_token"] or not http_requests:
         return None
     url = f"{GRAPH_URL}/me/messages/{message_id}/attachments/{attachment_id}/$value"
     try:
         resp = http_requests.get(
             url,
-            headers={"Authorization": f"Bearer {_graph_token['access_token']}"},
+            headers={"Authorization": f"Bearer {token['access_token']}"},
             timeout=HTTP_TIMEOUT,
         )
         if resp.status_code == 200:
             return resp.content
         if resp.status_code == 401:
-            _graph_token["access_token"] = None
-            _graph_token["expiry"] = None
+            token["access_token"] = None
+            token["expiry"] = None
     except Exception as exc:
         print(f"WARNING: attachment fetch failed for {message_id}: {exc}")
     return None
@@ -1702,7 +1802,8 @@ def _fetch_attachment_bytes(message_id, attachment_id):
 
 @app.route("/api/messages/<path:message_id>/attachments/<path:attachment_id>/analyze", methods=["POST"])
 def analyze_message_attachment(message_id, attachment_id):
-    idx, email = _find_email_by_message_id(message_id)
+    sess = _current_session()
+    idx, email = _find_email_by_message_id(message_id, sess)
     if email is None:
         return jsonify({"error": "Email not found"}), 404
 
@@ -1726,7 +1827,7 @@ def analyze_message_attachment(message_id, attachment_id):
             "message": "VirusTotal API key not configured. Set VIRUSTOTAL_API_KEY to enable.",
         })
 
-    content_bytes = _fetch_attachment_bytes(message_id, att.get("id") or attachment_id)
+    content_bytes = _fetch_attachment_bytes(sess, message_id, att.get("id") or attachment_id)
     if not content_bytes:
         return jsonify({
             "configured": True,
@@ -1767,7 +1868,8 @@ def analyze_message_attachment(message_id, attachment_id):
 
 @app.route("/api/messages/<path:message_id>/move-to-junk", methods=["POST"])
 def move_message_to_junk(message_id):
-    idx, email = _find_email_by_message_id(message_id)
+    sess = _current_session()
+    idx, email = _find_email_by_message_id(message_id, sess)
     if email is None:
         return jsonify({"error": "Email not found"}), 404
     return jsonify({
@@ -1864,7 +1966,7 @@ def _persist_scan_history(email, result):
               f"[{resp.status_code}]: {resp.text[:200]}")
 
 
-def _scan_email_common(email, idx):
+def _scan_email_common(sess, email, idx):
     if not detector.is_trained:
         return None, (jsonify({"error": "Model not loaded"}), 503)
 
@@ -1916,30 +2018,19 @@ def _scan_email_common(email, idx):
             "checks_run": list(threat_intel["checks"].keys()),
         },
     }
-    scan_results[message_id] = result
+    sess.scan_results[message_id] = result
     _persist_scan_history(email, result)
     return result, None
 
 
-@app.route("/api/scan/<int:idx>", methods=["POST"])
-def scan_email_v2(idx):
-    emails = _get_email_list()
-    if idx < 0 or idx >= len(emails):
-        return jsonify({"error": "Email not found"}), 404
-
-    result, error = _scan_email_common(emails[idx], idx)
-    if error:
-        return error
-    return jsonify(result)
-
-
 @app.route("/api/messages/<path:message_id>/scan", methods=["POST"])
 def scan_message(message_id):
-    idx, email = _find_email_by_message_id(message_id)
+    sess = _current_session()
+    idx, email = _find_email_by_message_id(message_id, sess)
     if email is None:
         return jsonify({"error": "Email not found"}), 404
 
-    result, error = _scan_email_common(email, idx)
+    result, error = _scan_email_common(sess, email, idx)
     if error:
         return error
     return jsonify(result)
@@ -1947,32 +2038,50 @@ def scan_message(message_id):
 
 @app.route("/api/scan-all", methods=["POST"])
 def scan_all_v2():
-    emails = _get_email_list()
+    sess = _current_session()
     if not detector.is_trained:
         return jsonify({"error": "Model not loaded"}), 503
+    folder = (request.args.get("folder") or "inbox").lower()
+    if folder not in ("inbox", "junk"):
+        return jsonify({"error": "Unknown folder"}), 400
+
+    now = datetime.now()
+    if sess._scan_all_in_flight:
+        return jsonify({"error": "A scan-all is already running for this session"}), 429
+    if sess._last_scan_all and (now - sess._last_scan_all).total_seconds() < _SCAN_ALL_COOLDOWN:
+        wait = int(_SCAN_ALL_COOLDOWN - (now - sess._last_scan_all).total_seconds())
+        return jsonify({"error": f"Please wait {wait}s before scanning again"}), 429
+
+    emails = _get_email_list(sess, folder)
     results = []
-    for i, email in enumerate(emails):
-        try:
-            result, error = _scan_email_common(email, i)
-            if error:
-                continue
-            results.append(result)
-        except Exception:
-            pass
-    results_dict = {str(r["idx"]): r for r in results}
-    return jsonify({"results": results_dict})
+    sess._scan_all_in_flight = True
+    try:
+        for i, email in enumerate(emails):
+            try:
+                result, error = _scan_email_common(sess, email, i)
+                if error:
+                    continue
+                results.append(result)
+            except Exception:
+                pass
+        results_dict = {r["id"]: r for r in results if r.get("id")}
+        return jsonify({"results": results_dict})
+    finally:
+        sess._scan_all_in_flight = False
+        sess._last_scan_all = datetime.now()
 
 
 @app.route("/api/stats", methods=["GET"])
 def get_stats_v2():
-    scanned = len(scan_results)
-    threats = sum(1 for r in scan_results.values() if r.get("prediction") == 1)
+    sess = _current_session()
+    scanned = len(sess.scan_results)
+    threats = sum(1 for r in sess.scan_results.values() if r.get("prediction") == 1)
     safe = scanned - threats
     return jsonify({
         "scanned": scanned,
         "threats": threats,
         "safe": safe,
-        "total": len(_get_email_list()),
+        "total": len(_get_email_list(sess, "inbox")),
     })
 
 

@@ -35,3 +35,4 @@ final(supabase_test_updated)/
 # PhishGuard local runtime state
 PHISHGUARD/phishguard_log.txt
 PHISHGUARD/sender_dna.json
+PHISHGUARD/local_scan_history.json
