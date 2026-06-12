@@ -2442,8 +2442,8 @@ async function moveToJunk(idx) {
         const res = await apiFetch('/api/messages/' + encodeURIComponent(messageId) + '/move-to-junk',
                                     { method: 'POST' });
         const data = await res.json();
-        if (data.error) {
-            setStatus('Failed: ' + data.error, 'error');
+        if (!res.ok || data.error || data.ok === false) {
+            setStatus('Failed: ' + (data.error || data.message || 'Could not move email'), 'error');
             return;
         }
         // Graph rewrites the message id when moving folders. Move the

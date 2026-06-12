@@ -1163,15 +1163,15 @@ def _graph_request(sess, endpoint, params=None):
     return r.json()
 
 
-def _fetch_all_emails(sess):
-    """Fetch all inbox emails via pagination."""
+def _fetch_folder_emails(sess, folder):
+    """Fetch all emails from a mail folder via Graph pagination."""
     all_emails = []
     params = {
         "$top": 250,
         "$select": "id,subject,from,receivedDateTime,bodyPreview,body,isRead,internetMessageHeaders,hasAttachments",
         "$orderby": "receivedDateTime desc",
     }
-    result = _graph_request(sess, "me/mailFolders/inbox/messages", params)
+    result = _graph_request(sess, f"me/mailFolders/{folder}/messages", params)
     all_emails.extend(result.get("value", []))
 
     # Follow @odata.nextLink until no more pages
@@ -1193,6 +1193,34 @@ def _fetch_all_emails(sess):
         next_link = data.get("@odata.nextLink")
 
     return all_emails
+
+
+def _fetch_all_emails(sess):
+    return _fetch_folder_emails(sess, "inbox")
+
+
+def _fetch_junk_emails(sess):
+    return _fetch_folder_emails(sess, "junkemail")
+
+
+def _graph_post(sess, endpoint, json_data=None):
+    token = sess.graph_token
+    if not token["access_token"]:
+        raise ValueError("Not authenticated")
+    headers = {
+        "Authorization": f"Bearer {token['access_token']}",
+        "Content-Type": "application/json",
+    }
+    r = http_requests.post(
+        f"{GRAPH_URL}/{endpoint}", headers=headers, json=json_data,
+        timeout=HTTP_TIMEOUT,
+    )
+    if r.status_code == 401:
+        token["access_token"] = None
+        token["expiry"] = None
+        raise ValueError("Token expired")
+    r.raise_for_status()
+    return r
 
 
 # ── OAuth Routes ─────────────────────────────────────────────────────────────
@@ -1463,8 +1491,10 @@ def auth_supabase_provider():
 
     try:
         sess.live_emails = _fetch_all_emails(sess)
+        sess.junk_emails = _fetch_junk_emails(sess)
     except Exception as exc:
         sess.live_emails = []
+        sess.junk_emails = []
         sess.live_mode = False
         return jsonify({"error": f"Could not fetch Outlook emails: {exc}"}), 502
 
@@ -1560,8 +1590,10 @@ def auth_callback():
         # the main window poll sees "connected" but emails aren't loaded yet
         try:
             sess.live_emails = _fetch_all_emails(sess)
+            sess.junk_emails = _fetch_junk_emails(sess)
         except Exception as e:
             sess.live_emails = []
+            sess.junk_emails = []
 
         # Now mark live — the poll will see "connected" and loadEmails()
         # will return the real emails
@@ -1630,6 +1662,7 @@ def auth_refresh_emails():
         return jsonify({"error": "Not connected"}), 401
     try:
         sess.live_emails = _fetch_all_emails(sess)
+        sess.junk_emails = _fetch_junk_emails(sess)
         sess.scan_results.clear()
         return jsonify({"count": len(sess.live_emails)})
     except Exception as e:
@@ -1869,15 +1902,46 @@ def analyze_message_attachment(message_id, attachment_id):
 @app.route("/api/messages/<path:message_id>/move-to-junk", methods=["POST"])
 def move_message_to_junk(message_id):
     sess = _current_session()
-    idx, email = _find_email_by_message_id(message_id, sess)
+    idx, email = _find_email_by_message_id(message_id, sess, "inbox")
     if email is None:
-        return jsonify({"error": "Email not found"}), 404
-    return jsonify({
-        "ok": False,
-        "old_id": _message_key(email, idx),
-        "new_id": _message_key(email, idx),
-        "message": "Move to junk is not enabled in the lightweight backend.",
-    }), 501
+        return jsonify({"error": "Message not found in inbox"}), 404
+    try:
+        resp = _graph_post(
+            sess,
+            f"me/messages/{message_id}/move",
+            {"destinationId": "junkemail"},
+        )
+        new_id = message_id
+        try:
+            moved = resp.json() if resp is not None else None
+            if isinstance(moved, dict) and moved.get("id"):
+                new_id = moved["id"]
+        except Exception:
+            pass
+
+        sess.live_emails = [
+            e for e in sess.live_emails
+            if _message_key(e, -1) != message_id
+        ]
+        email["id"] = new_id
+        email["folder"] = "junk"
+        sess.junk_emails.insert(0, email)
+
+        if message_id in sess.scan_results and new_id != message_id:
+            sr = sess.scan_results.pop(message_id)
+            sr["id"] = new_id
+            sr["messageId"] = new_id
+            sess.scan_results[new_id] = sr
+
+        return jsonify({
+            "ok": True,
+            "message": "Moved to junk",
+            "old_id": message_id,
+            "new_id": new_id,
+        })
+    except Exception as exc:
+        print(f"WARNING: move-to-junk failed for {message_id}: {exc}")
+        return jsonify({"error": "Move failed"}), 500
 
 
 @app.route("/api/auth/photo", methods=["GET"])
