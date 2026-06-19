@@ -1,0 +1,10 @@
+{
+  "base_model": "trained from prep_data.py",
+  "max_length": 512,
+  "threshold": 0.1477966101694915,
+  "labels": {
+    "0": "SAFE",
+    "1": "PHISHING"
+  },
+  "runtime": "onnxruntime"
+}

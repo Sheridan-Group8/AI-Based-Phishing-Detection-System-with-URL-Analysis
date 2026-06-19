@@ -18,7 +18,8 @@
       "preload.js",
       "app.py",
       "phishing_detector.py",
-      "phishing_model.pkl",
+      "bigmodel/onnx-model/**/*",
+      "bigmodel/onnx-url-model/**/*",
       "static/**/*",
       "templates/**/*",
       "requirements.txt"
@@ -30,7 +31,8 @@
         "filter": [
           "app.py",
           "phishing_detector.py",
-          "phishing_model.pkl",
+          "bigmodel/onnx-model/**/*",
+          "bigmodel/onnx-url-model/**/*",
           "static/**/*",
           "templates/**/*",
           "requirements.txt"

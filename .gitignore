@@ -38,4 +38,6 @@ PHISHGUARD/sender_dna.json
 PHISHGUARD/local_scan_history.json
 final-bigmodeltest
 bigmodel
+!PHISHGUARD/bigmodel/
+!PHISHGUARD/bigmodel/**
 final-bigmodeltest\final-bigmodeltest

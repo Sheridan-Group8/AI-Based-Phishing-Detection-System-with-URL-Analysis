@@ -20,7 +20,7 @@ from urllib.parse import urlencode, urlparse
 
 from flask import Flask, jsonify, redirect, request, send_from_directory, session
 
-from phishing_detector import PhishingDetector
+from phishing_detector import OnnxClassifier, PhishingDetector
 
 try:
     import requests as http_requests
@@ -129,12 +129,30 @@ def _supabase_request(method, path, jwt, json_body=None, params=None,
 #  Load Model
 # ─────────────────────────────────────────────────────────────────────────────
 detector = PhishingDetector()
-MODEL_PATH = Path(__file__).parent / "phishing_model.pkl"
-try:
-    detector.load_model(str(MODEL_PATH))
-    print("PhishGuard model loaded successfully.")
-except Exception as e:
-    print(f"WARNING: Could not load model: {e}")
+ONNX_DIR = Path(__file__).parent / "bigmodel" / "onnx-model"
+URL_ONNX_DIR = Path(__file__).parent / "bigmodel" / "onnx-url-model"
+_onnx_enabled = os.environ.get("PHISHGUARD_ONNX") != "0"
+
+if _onnx_enabled:
+    try:
+        text_model = OnnxClassifier(str(ONNX_DIR))
+        if text_model.load():
+            detector.text_model = text_model
+            detector.is_trained = True
+            print("PhishGuard text AI active (local ONNX model).")
+    except Exception as e:
+        print(f"WARNING: ONNX text model init failed: {e}")
+
+    try:
+        url_model = OnnxClassifier(str(URL_ONNX_DIR))
+        if url_model.load():
+            detector.url_model = url_model
+            print("PhishGuard URL AI active (local ONNX model).")
+    except Exception as e:
+        print(f"WARNING: ONNX URL model init failed: {e}")
+
+if not detector.is_trained:
+    print("WARNING: No runtime text model loaded. Scanning will be unavailable.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Per-session server-side state
@@ -2165,7 +2183,7 @@ def _scan_email_common(sess, email, idx):
     threat_intel = run_threat_intel(email, urls_found)
 
     try:
-        prediction, confidence, url_analysis, header_result = detector.predict(
+        prediction, confidence, url_analysis, header_result, model_score = detector.predict(
             full, headers=email.get("internetMessageHeaders"))
         url_analysis, header_result = _make_serializable(url_analysis, header_result)
     except Exception as e:
@@ -2188,6 +2206,7 @@ def _scan_email_common(sess, email, idx):
         "idx": idx,
         "prediction": prediction,
         "confidence": confidence,
+        "model_score": _to_native(model_score),
         "url_analysis": url_analysis,
         "header_result": header_result,
         "threat_intel": {
