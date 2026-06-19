@@ -894,7 +894,61 @@ def run_threat_intel(email, urls_in_email=None):
         "confirmed_phishing": False,
         "confidence_boost": 0.0,
         "signals": [],
+        "url_threats": {},
     }
+
+    seen_hosts = set()
+    for raw_url in (urls_in_email or [])[:_MAX_URLS_PER_EMAIL]:
+        url = (raw_url or "").strip()
+        if not url:
+            continue
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except Exception:
+            host = ""
+
+        pt_url = _check_phishtank_url(url)
+        if pt_url is True:
+            results["url_threats"][url] = {
+                "malicious": True,
+                "sources": ["PhishTank"],
+            }
+            results["confirmed_phishing"] = True
+            results["signals"].append(f"PhishTank: link is confirmed phishing ({url})")
+
+        if host and host not in seen_hosts:
+            seen_hosts.add(host)
+            sources = []
+            if _check_urlhaus(host) is True:
+                sources.append("URLhaus")
+            us_host = _check_urlscan(host)
+            if isinstance(us_host, dict):
+                if us_host.get("malicious"):
+                    sources.append("urlscan.io")
+                elif us_host.get("verdict") == "suspicious":
+                    results["url_threats"][host] = {
+                        "malicious": False,
+                        "suspicious": True,
+                        "sources": ["urlscan.io"],
+                    }
+                    results["signals"].append(
+                        f"urlscan.io: prior scans scored this link host risky ({host})"
+                    )
+                elif us_host.get("verdict") == "clean":
+                    results["url_threats"][host] = {
+                        "malicious": False,
+                        "urlscan_clean": True,
+                    }
+            if sources:
+                results["url_threats"][host] = {
+                    "malicious": True,
+                    "sources": sources,
+                }
+                results["confirmed_phishing"] = True
+                results["signals"].append(
+                    f"{'/'.join(sources)}: link host is confirmed malicious ({host})"
+                )
+
     if not domain:
         return results
 
@@ -903,13 +957,6 @@ def run_threat_intel(email, urls_in_email=None):
     if pt is True:
         results["confirmed_phishing"] = True
         results["signals"].append("PhishTank: Domain is a confirmed phishing site")
-
-    for url in (urls_in_email or [])[:20]:
-        pt_url = _check_phishtank_url(url)
-        if pt_url is True:
-            results["confirmed_phishing"] = True
-            results["signals"].append("Threat feed: URL is confirmed phishing")
-            break
 
     uh = _check_urlhaus(domain)
     results["checks"]["urlhaus"] = uh
@@ -1012,6 +1059,51 @@ def _html_to_text(raw_html):
     text = "\n".join(lines)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
+
+
+class _HTMLLinkExtractor(HTMLParser):
+    """Collect real destinations hidden in HTML attributes."""
+    _URL_ATTRS = {
+        "a": ("href",),
+        "area": ("href",),
+        "img": ("src",),
+        "iframe": ("src",),
+        "form": ("action",),
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.urls = []
+
+    def handle_starttag(self, tag, attrs):
+        wanted = self._URL_ATTRS.get(tag.lower())
+        if not wanted:
+            return
+        for name, value in attrs:
+            if name.lower() in wanted and value:
+                v = value.strip()
+                if v.lower().startswith(("http://", "https://")):
+                    self.urls.append(v)
+
+
+def _extract_html_link_urls(raw_html, limit=_MAX_URLS_PER_EMAIL):
+    """Return deduplicated http(s) URLs from href/src/action HTML attrs."""
+    if not raw_html or "<" not in raw_html:
+        return []
+    try:
+        parser = _HTMLLinkExtractor()
+        parser.feed(raw_html)
+    except Exception:
+        return []
+    seen, out = set(), []
+    for url in parser.urls:
+        url = url[:2048]
+        if url not in seen:
+            seen.add(url)
+            out.append(url)
+        if len(out) >= limit:
+            break
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2117,6 +2209,541 @@ def _make_serializable(url_analysis, header_result):
     return _to_native(url_analysis), _to_native(header_result)
 
 
+_CRED_KEYWORDS = (
+    "login", "signin", "sign-in", "verify", "confirm", "password",
+    "credential", "authenticate", "reactivate", "revalidate", "validate",
+)
+_LURE_PHRASES = (
+    "inactive", "deactivat", "suspend", "reactivat", "verify your",
+    "confirm your", "confirm that you", "unusual activity", "unusual sign",
+    "validate your", "re-validate", "revalidate", "password expires",
+    "password will expire", "storage is full", "mailbox is full",
+    "update your billing", "update your payment", "avoid suspension",
+    "account has been", "still use this account", "flagged as",
+)
+_RISKY_TLDS = {
+    "test", "example", "invalid", "localhost", "zip", "mov", "xyz", "top",
+    "click", "link", "buzz", "tk", "ml", "ga", "cf", "gq", "work", "fit",
+    "rest", "country", "kim", "loan", "men", "review", "date", "racing",
+    "stream", "download", "win", "bid", "trade",
+}
+_CRED_LURE = (
+    "verify your", "confirm your", "confirm that you", "log in", "login",
+    "sign in", "signin", "update your password", "reset your password",
+    "validate your", "re-validate", "revalidate", "verify your identity",
+    "confirm your identity", "unusual activity", "unusual sign-in",
+    "account has been", "account is", "suspend", "deactivat", "reactivat",
+    "still use this account", "secure your account", "billing portal",
+)
+_BRAND_DOMAINS = {
+    "paypal.com", "microsoft.com", "apple.com", "amazon.com", "google.com",
+    "netflix.com", "facebook.com", "instagram.com", "linkedin.com",
+    "chase.com", "bankofamerica.com", "wellsfargo.com",
+    "americanexpress.com", "dhl.com", "fedex.com", "ups.com",
+    "docusign.com", "dropbox.com", "adobe.com", "coinbase.com",
+    "outlook.com", "office.com", "icloud.com",
+}
+URL_MODEL_SOLO_CAP = 45
+
+
+def _risk_level(score):
+    return "high" if score >= 65 else ("elevated" if score >= 40 else "low")
+
+
+def _join_and(items):
+    items = [i for i in items if i]
+    if len(items) <= 1:
+        return items[0] if items else ""
+    if len(items) == 2:
+        return items[0] + " and " + items[1]
+    return ", ".join(items[:-1]) + ", and " + items[-1]
+
+
+def _link_domain_untrusted(host):
+    host = (host or "").lower().strip(".")
+    if not host:
+        return False
+    if host in _TRUSTED_DOMAINS:
+        return False
+    if any(host.endswith("." + td) for td in _TRUSTED_DOMAINS):
+        return False
+    if host.split(".")[-1] in _TRUSTED_DOMAINS:
+        return False
+    return True
+
+
+def _reg_domain(value):
+    value = (value or "").strip().lower().strip("<>").strip()
+    if "@" in value:
+        value = value.rsplit("@", 1)[-1]
+    if "://" in value:
+        try:
+            value = urlparse(value).hostname or value
+        except Exception:
+            pass
+    value = value.split("/")[0].split(":")[0].strip(".")
+    parts = [p for p in value.split(".") if p]
+    return ".".join(parts[-2:]) if len(parts) >= 2 else value
+
+
+def _hdr_dict(headers):
+    out = {}
+    if isinstance(headers, list):
+        for header in headers:
+            if isinstance(header, dict):
+                name = (header.get("name") or "").strip().lower()
+                value = (header.get("value") or "").strip()
+                if name:
+                    out[name] = (out[name] + " " + value) if name in out else value
+    return out
+
+
+def _score_link(url, url_threats, analyzer):
+    try:
+        host = (urlparse(url if "://" in url else "http://" + url).hostname or "").lower()
+    except Exception:
+        host = ""
+    feats = analyzer.analyze_url(url) if analyzer else {}
+    url_feed = (url_threats or {}).get(url) or {}
+    host_feed = ((url_threats.get(host) if (host and url_threats) else None)) or {}
+    tld = host.rsplit(".", 1)[-1] if "." in host else ""
+
+    model_score = None
+    url_model = getattr(detector, "url_model", None)
+    if url_model is not None and getattr(url_model, "is_loaded", False):
+        try:
+            prob = url_model.predict_proba(url)
+            if prob is not None:
+                model_score = int(round(prob * 100))
+        except Exception:
+            model_score = None
+
+    feed_malicious = bool(url_feed.get("malicious") or host_feed.get("malicious"))
+    feed_suspicious = bool(url_feed.get("suspicious") or host_feed.get("suspicious"))
+    urlscan_clean = bool(host_feed.get("urlscan_clean"))
+    trusted = bool(host and not _link_domain_untrusted(host))
+
+    if trusted:
+        structural, reason = 5, "Goes to a recognized, trusted domain."
+    elif feats.get("has_ip_address"):
+        structural, reason = 90, "Uses a raw IP address instead of a domain name."
+    elif feats.get("has_at_symbol"):
+        structural, reason = 90, "Contains an '@' that hides the link's true destination."
+    elif feats.get("has_brand_in_subdomain"):
+        structural, reason = 90, "Puts a well-known brand name in the subdomain to look legitimate."
+    elif host.startswith("xn--") or ".xn--" in host:
+        structural, reason = 85, "Uses punycode - a possible look-alike of a real domain."
+    elif feats.get("is_shortened"):
+        structural, reason = 65, "Shortened link that hides where it actually goes."
+    elif feats.get("suspicious_tld") or tld in _RISKY_TLDS:
+        structural, reason = 65, "Unfamiliar domain on a high-risk top-level domain (." + tld + ")."
+    elif feats.get("has_suspicious_keyword"):
+        structural, reason = 40, "Unfamiliar domain using security/account wording in the link."
+    else:
+        structural, reason = 22, "Goes to an unfamiliar domain."
+
+    reputation = ("malicious" if feed_malicious else "suspicious" if feed_suspicious
+                  else "trusted" if trusted else "clean" if urlscan_clean else "unknown")
+    sources = (url_feed.get("sources") or []) + (host_feed.get("sources") or [])
+    checks = []
+    if any("phishtank" in s.lower() for s in sources):
+        checks.append({"src": "PhishTank", "result": "flagged"})
+    if any("urlscan" in s.lower() for s in sources):
+        checks.append({"src": "urlscan.io", "result": "malicious" if feed_malicious else "suspicious"})
+    elif host_feed.get("urlscan_clean"):
+        checks.append({"src": "urlscan.io", "result": "clean"})
+    if any("URLhaus" in s for s in sources):
+        checks.append({"src": "URLhaus", "result": "flagged"})
+
+    def result(score, msg, decided_by):
+        score = int(max(0, min(100, score)))
+        return score, msg, {
+            "score": score,
+            "model": model_score,
+            "structural": structural,
+            "reputation": reputation,
+            "in_malicious_db": feed_malicious,
+            "checks": checks,
+            "decided_by": decided_by,
+        }
+
+    if feed_malicious:
+        srcs = "/".join(dict.fromkeys(sources)) or "threat feed"
+        return result(100, "Confirmed malicious - listed on " + srcs + ".", "threat_db")
+    if trusted:
+        return result(5, reason, "trusted_domain")
+
+    score, decided = structural, "structural"
+    corroborated = structural >= 65 or feed_suspicious
+    if model_score is not None and model_score > score:
+        if urlscan_clean:
+            pass
+        elif corroborated:
+            score, reason, decided = model_score, "The URL model flags this link as likely malicious.", "model+corroboration"
+        else:
+            capped = min(model_score, URL_MODEL_SOLO_CAP)
+            if capped > score:
+                score, reason, decided = capped, (
+                    "The URL model finds this link's pattern unusual, but no reputation source corroborates it - treat with caution."
+                ), "model_uncorroborated"
+    if feed_suspicious and score < 70:
+        score, reason, decided = 70, "Prior urlscan analyses scored this link's host risky.", "reputation_suspicious"
+    if urlscan_clean and decided == "structural" and score <= 25:
+        score, reason, decided = 10, "Checked against urlscan - no threats found.", "reputation_clean"
+    return result(score, reason, decided)
+
+
+def _assess_links(urls, url_threats, analyzer):
+    if not urls:
+        return {"score": 0, "level": "low", "summary": "No links in this message.", "links": []}
+    scored = []
+    for url in urls[:_MAX_URLS_PER_EMAIL]:
+        score, reason, factors = _score_link(url, url_threats, analyzer)
+        scored.append({"url": url, "score": score, "level": _risk_level(score),
+                       "reason": reason, "factors": factors})
+    top = max(scored, key=lambda item: item["score"])
+    high = sum(1 for item in scored if item["score"] >= 65)
+    if top["score"] >= 65:
+        summary = (f"{high} dangerous link(s). " if high > 1 else "") + top["reason"]
+    elif top["score"] >= 40:
+        summary = top["reason"]
+    else:
+        summary = f"{len(scored)} link(s), none clearly dangerous."
+    return {"score": top["score"], "level": _risk_level(top["score"]),
+            "summary": summary, "links": scored}
+
+
+def _assess_content(model_score, full_text, struct):
+    text = (full_text or "").lower()
+    model_pct = int(round(max(0.0, min(1.0, model_score)) * 100))
+    heuristic = 0
+    findings, tags = [], []
+    urgency = [word for word in struct.URGENCY_WORDS if word in text]
+    threat = [word for word in struct.THREAT_WORDS if word in text]
+    money = [word for word in struct.MONEY_WORDS if word in text]
+    credential = any(phrase in text for phrase in _CRED_LURE)
+    if credential:
+        heuristic += 45
+    if urgency:
+        heuristic += 25
+    if threat:
+        heuristic += 30
+    if money:
+        heuristic += 20
+    score = max(model_pct, min(100, heuristic))
+    if model_pct >= 60:
+        findings.append("Wording matches patterns the AI model links to phishing.")
+        tags.append("ai_content")
+    if credential:
+        findings.append("Asks you to confirm, verify, or sign in to an account.")
+        tags.append("credential_harvesting")
+    if urgency or threat:
+        findings.append("Uses urgency or pressure language.")
+        tags.append("urgency")
+    if money:
+        findings.append("References payments, invoices, or money.")
+        tags.append("financial")
+    if not findings:
+        findings.append("No strong phishing language detected.")
+    return {"score": score, "level": _risk_level(score),
+            "summary": findings[0], "findings": findings, "tags": tags}
+
+
+def analyze_email_auth(headers, from_addr, header_result):
+    out = {"risk": 0, "signals": [], "positives": [], "tags": [],
+           "sender_ip": None, "aligned": None, "reply_to_mismatch": False,
+           "provider_signal": None}
+    header_map = _hdr_dict(headers)
+    if not header_map and not header_result:
+        return out
+
+    auth_results = " ".join(
+        value for key, value in header_map.items()
+        if key in ("authentication-results", "arc-authentication-results")
+        or key.startswith("x-ms-exchange-authentication-results")
+    )
+
+    def grab(pattern, source=auth_results):
+        match = re.search(pattern, source, re.I)
+        return match.group(1).strip().lower() if match else ""
+
+    from_dom = _reg_domain(from_addr) or _reg_domain(header_map.get("from", ""))
+    mailfrom = _reg_domain(grab(r"smtp\.mailfrom=([^\s;]+)"))
+    header_d = _reg_domain(grab(r"header\.d=([^\s;]+)"))
+    return_path = _reg_domain(header_map.get("return-path", ""))
+    authed = {domain for domain in (mailfrom, header_d, return_path) if domain}
+    dmarc = str((header_result or {}).get("dmarc") or "").lower()
+
+    if dmarc == "pass":
+        out["aligned"] = True
+    elif from_dom and authed:
+        out["aligned"] = from_dom in authed
+    if out["aligned"] is True:
+        out["positives"].append("From aligns with the authenticated sender domain.")
+    elif out["aligned"] is False:
+        is_brand = from_dom in _BRAND_DOMAINS or any(from_dom.endswith("." + brand) for brand in _BRAND_DOMAINS)
+        if is_brand:
+            out["risk"] = max(out["risk"], 85)
+            out["tags"].append("domain_spoof")
+            out["signals"].append(
+                f"Brand spoof: visible sender '{from_dom}' does not align with the authenticated domain ({', '.join(sorted(authed)) or 'none'})."
+            )
+        else:
+            out["risk"] = max(out["risk"], 45)
+            out["signals"].append(
+                f"Sender domain '{from_dom}' does not align with the authenticated domain ({', '.join(sorted(authed))})."
+            )
+
+    reply_to = _reg_domain(header_map.get("reply-to", ""))
+    if reply_to and from_dom and reply_to != from_dom and reply_to not in authed:
+        out["reply_to_mismatch"] = True
+        out["risk"] = max(out["risk"], 45)
+        out["tags"].append("reply_to_mismatch")
+        out["signals"].append(f"Replies go to a different domain ('{reply_to}') than the sender.")
+
+    forefront = header_map.get("x-forefront-antispam-report", "")
+    compauth = grab(r"compauth=(\w+)")
+    category = grab(r"CAT:(\w+)", forefront)
+    sfv = grab(r"SFV:(\w+)", forefront)
+    try:
+        scl = int(header_map.get("x-ms-exchange-organization-scl", grab(r"SCL:(-?\d+)", forefront) or "999"))
+    except Exception:
+        scl = None
+
+    if category in ("phsh", "hphsh", "spoof") or sfv == "phsh":
+        out["risk"] = max(out["risk"], 60)
+        out["tags"].append("provider_flagged")
+        msg = f"Microsoft classified this message as {category or sfv}."
+        out["signals"].append(msg)
+        out["provider_signal"] = {"status": "fail", "label": "Flagged", "message": msg}
+    elif compauth == "fail":
+        out["risk"] = max(out["risk"], 55)
+        out["tags"].append("provider_flagged")
+        msg = "Microsoft composite authentication (compauth) failed."
+        out["signals"].append(msg)
+        out["provider_signal"] = {"status": "fail", "label": "CompAuth fail", "message": msg}
+    elif scl is not None and 0 <= scl <= 99 and scl >= 5:
+        out["risk"] = max(out["risk"], 40)
+        msg = f"Elevated Microsoft spam confidence (SCL {scl})."
+        out["signals"].append(msg)
+        out["provider_signal"] = {"status": "warn", "label": f"SCL {scl}", "message": msg}
+    elif sfv == "spm" or category == "spm":
+        out["risk"] = max(out["risk"], 35)
+        msg = "Microsoft marked this message as spam."
+        out["signals"].append(msg)
+        out["provider_signal"] = {"status": "warn", "label": "Spam", "message": msg}
+
+    if compauth == "pass":
+        out["positives"].append("Microsoft composite authentication: pass.")
+    if scl is not None and -1 <= scl <= 0:
+        out["positives"].append(f"Low Microsoft spam confidence (SCL {scl}).")
+    out["sender_ip"] = (
+        header_map.get("x-sender-ip")
+        or header_map.get("x-ms-exchange-crosstenant-originalattributedtenantconnectingip")
+        or None
+    )
+    return out
+
+
+def _assess_auth(header_result, headers=None, from_addr=""):
+    score, findings, tags = 0, [], []
+    header_result = header_result or {}
+
+    def value(key):
+        return str(header_result.get(key) or "").lower()
+
+    failures = [key.upper() for key in ("spf", "dkim", "dmarc") if value(key) == "fail"]
+    missing = [key.upper() for key in ("spf", "dkim", "dmarc") if value(key) in ("none", "")]
+    if failures:
+        score = max(score, 70)
+        findings.append("Failed authentication: " + ", ".join(failures) + ".")
+        tags.append("auth_fail")
+    elif len(missing) == 3:
+        score = max(score, 15)
+        findings.append("No SPF/DKIM/DMARC records present.")
+    else:
+        findings.append("SPF/DKIM/DMARC passed.")
+
+    auth = analyze_email_auth(headers, from_addr, header_result)
+    score = max(score, auth["risk"])
+    findings.extend(auth["signals"])
+    for tag in auth["tags"]:
+        if tag not in tags:
+            tags.append(tag)
+    if auth["aligned"] is True and not auth["signals"] and score < 30:
+        findings.insert(0, "Fully verified - " + " ".join(auth["positives"][:2]))
+    return {"score": score, "level": _risk_level(score),
+            "summary": findings[0] if findings else "No authentication issues.",
+            "findings": findings, "tags": tags,
+            "detail": {"aligned": auth["aligned"],
+                       "reply_to_mismatch": auth["reply_to_mismatch"],
+                       "provider_signal": auth["provider_signal"],
+                       "sender_ip": auth["sender_ip"]}}
+
+
+def _assess_sender(threat_intel):
+    score, findings, tags = 0, [], []
+    checks = (threat_intel or {}).get("checks", {}) or {}
+    rep = checks.get("domain_reputation")
+    if isinstance(rep, dict) and rep.get("category") == "suspicious":
+        score = max(score, 35)
+        signals = rep.get("signals") or []
+        findings.append("Sender domain looks unfamiliar" + (": " + signals[0][1] if signals and len(signals[0]) > 1 else "."))
+        tags.append("suspicious_domain")
+    abuse = checks.get("abuseipdb")
+    if isinstance(abuse, dict) and abuse.get("is_abusive"):
+        score = max(score, 75)
+        findings.append(f"Sender IP has a high abuse score ({abuse.get('score')}%).")
+        tags.append("abusive_ip")
+    if not findings:
+        findings.append("No sender-reputation concerns.")
+    return {"score": score, "level": _risk_level(score),
+            "summary": findings[0], "findings": findings, "tags": tags}
+
+
+def _assess_attachments(attachments):
+    items, score, findings, tags = [], 0, [], []
+    for attachment in (attachments or []):
+        name = _attachment_name(attachment)
+        risk, reason = _classify_attachment(name)
+        items.append({"name": name, "risk": risk, "reason": reason, "vt": None})
+        if risk == "dangerous":
+            score = max(score, 90)
+        elif risk == "caution":
+            score = max(score, 55)
+    danger = [item["name"] for item in items if item["risk"] == "dangerous"]
+    caution = [item["name"] for item in items if item["risk"] == "caution"]
+    if danger:
+        findings.append("Dangerous attachment: " + danger[0])
+        tags.append("dangerous_attachment")
+    if caution:
+        findings.append("Risky attachment: " + caution[0])
+        tags.append("risky_attachment")
+    if not items:
+        summary = "No attachments."
+    elif not findings:
+        summary = f"{len(items)} attachment(s), none risky."
+    else:
+        summary = findings[0]
+    return {"score": score, "level": _risk_level(score), "summary": summary,
+            "findings": findings, "tags": tags, "items": items}
+
+
+def _compute_assessment(model_score, full_text, urls, url_threats,
+                        header_result, threat_intel, struct,
+                        headers=None, from_addr="", attachments=None):
+    content = _assess_content(model_score, full_text, struct)
+    links = _assess_links(urls, url_threats, detector.url_analyzer)
+    sender = _assess_sender(threat_intel)
+    auth = _assess_auth(header_result, headers, from_addr)
+    files = _assess_attachments(attachments)
+    dimensions = [content, links, sender, auth, files]
+    scores = [dim["score"] for dim in dimensions]
+    base_max = max(scores)
+    if base_max >= 50:
+        prod = 1.0
+        for score in scores:
+            prod *= (1.0 - score / 100.0)
+        overall = round((1.0 - prod) * 100)
+    else:
+        overall = base_max
+    if threat_intel.get("confirmed_phishing"):
+        overall = max(overall, 97)
+    overall = int(max(0, min(100, overall)))
+    verdict = 1 if overall >= 50 else 0
+    driver = max(dimensions, key=lambda dim: dim["score"])
+    if verdict:
+        summary = "Likely phishing - " + driver["summary"]
+    elif overall >= 30:
+        summary = "Probably safe, but worth a look - " + driver["summary"]
+    else:
+        summary = "No phishing indicators found."
+
+    actions = []
+    if verdict:
+        if links["score"] >= 50:
+            actions.append("Do not click any links in this message.")
+        actions.append("Do not reply or share passwords, codes, or payment details.")
+        if sender["score"] >= 50:
+            actions.append("Verify the sender through a channel you already trust.")
+        actions.append("Report the message and delete it.")
+
+    threats = []
+    concern = 50
+    if content["score"] >= concern:
+        tags = content.get("tags", [])
+        if "credential_harvesting" in tags:
+            threats.append({"title": "Credential Harvesting", "severity": "high",
+                            "desc": "Requests personal identity or account verification through the message or a link."})
+        if "urgency" in tags:
+            threats.append({"title": "Urgency Manipulation", "severity": "medium",
+                            "desc": "Creates artificial urgency or pressure to force a hasty action."})
+        if "financial" in tags:
+            threats.append({"title": "Financial Lure", "severity": "medium",
+                            "desc": "References payments, invoices, refunds, or money to bait a response."})
+        if "ai_content" in tags and "credential_harvesting" not in tags and "urgency" not in tags:
+            threats.append({"title": "Suspicious Wording", "severity": "medium",
+                            "desc": "The message text matches patterns the AI model associates with phishing."})
+    for link in links.get("links", [])[:3]:
+        if link.get("score", 0) < concern:
+            continue
+        reason = link.get("reason", "")
+        title = "Known Malicious Link" if "Confirmed malicious" in reason else (
+            "Domain Spoofing" if "brand" in reason.lower() else "Suspicious Link")
+        threats.append({"title": title,
+                        "severity": "high" if link["score"] >= 65 else "medium",
+                        "desc": reason})
+    if sender["score"] >= concern:
+        tags = sender.get("tags", [])
+        if "abusive_ip" in tags:
+            threats.append({"title": "Abusive Sender IP", "severity": "high",
+                            "desc": "The sending IP address has a high abuse score."})
+        if "suspicious_domain" in tags:
+            threats.append({"title": "Suspicious Sender Domain", "severity": "medium",
+                            "desc": "The sender domain is unfamiliar or has a low reputation."})
+    if auth["score"] >= concern:
+        tags = auth.get("tags", [])
+        if "domain_spoof" in tags:
+            threats.append({"title": "Domain Spoofing", "severity": "high",
+                            "desc": "The visible sender does not align with the authenticated sending domain."})
+        if "auth_fail" in tags:
+            threats.append({"title": "Failed Authentication", "severity": "high",
+                            "desc": "The sender failed SPF/DKIM/DMARC checks."})
+        if "reply_to_mismatch" in tags:
+            threats.append({"title": "Reply Address Mismatch", "severity": "medium",
+                            "desc": "Replies would go to a different domain than the sender."})
+        if "provider_flagged" in tags:
+            threats.append({"title": "Provider-Flagged Sender", "severity": "medium",
+                            "desc": "Microsoft's mail protection flagged this message."})
+    file_tags = files.get("tags", [])
+    if "dangerous_attachment" in file_tags:
+        threats.append({"title": "Dangerous Attachment", "severity": "high",
+                        "desc": files["summary"] + " - do not open it."})
+    elif "risky_attachment" in file_tags:
+        threats.append({"title": "Risky Attachment", "severity": "medium",
+                        "desc": files["summary"]})
+
+    seen, deduped = set(), []
+    for threat in threats:
+        if threat["title"] in seen:
+            continue
+        seen.add(threat["title"])
+        deduped.append(threat)
+    threats = deduped[:6]
+    if verdict and not threats:
+        threats.append({"title": "Suspicious Message", "severity": "high",
+                        "desc": driver.get("summary") or "This message matches patterns associated with phishing."})
+    return {
+        "overall": overall,
+        "verdict": verdict,
+        "summary": summary,
+        "dimensions": {"content": content, "links": links, "sender": sender,
+                       "auth": auth, "files": files},
+        "actions": actions,
+        "threats": threats,
+    }
+
+
 def _sender_address(email):
     sender = email.get("from", {})
     if isinstance(sender, dict) and "emailAddress" in sender:
@@ -2130,22 +2757,34 @@ def _scan_history_row(email, result):
     """Build DB-safe scan metadata. Never stores message body or attachments."""
     sender_addr = _sender_address(email)
     domain = sender_addr.split("@")[-1].lower() if "@" in sender_addr else None
+    signals = {
+        "intel_signals": list(
+            (result.get("threat_intel") or {}).get("signals", []) or []
+        )[:20],
+        "checks_run": list(
+            (result.get("threat_intel") or {}).get("checks", {}).keys()
+        ),
+        "confirmed": bool(
+            (result.get("threat_intel") or {}).get("confirmed", False)
+        ),
+    }
+    if result.get("assessment") is not None:
+        signals["assessment"] = _to_native(result["assessment"])
+    if result.get("risk_score") is not None:
+        signals["risk_score"] = int(result["risk_score"])
+    if result.get("header_result") is not None:
+        header_result = result["header_result"] if isinstance(result["header_result"], dict) else {}
+        signals["header_result"] = {
+            key: header_result.get(key)
+            for key in ("spf", "dkim", "dmarc")
+            if header_result.get(key) is not None
+        }
     return {
         "message_id": str(email.get("id") or result.get("idx") or ""),
         "sender_domain": domain,
         "prediction": int(result.get("prediction", 0)),
         "confidence": float(result.get("confidence", 0) or 0),
-        "signals": {
-            "intel_signals": list(
-                (result.get("threat_intel") or {}).get("signals", []) or []
-            )[:20],
-            "checks_run": list(
-                (result.get("threat_intel") or {}).get("checks", {}).keys()
-            ),
-            "confirmed": bool(
-                (result.get("threat_intel") or {}).get("confirmed", False)
-            ),
-        },
+        "signals": signals,
     }
 
 
@@ -2179,25 +2818,50 @@ def _scan_email_common(sess, email, idx):
     full = f"Subject: {subject}\n\n{body_t}"
     scan_body = body_t[:_MAX_BODY_FOR_REGEX]
     url_pattern = re.compile(r'https?://[^\s<>"\'`]{1,2048}')
-    urls_found = url_pattern.findall(scan_body)[:_MAX_URLS_PER_EMAIL]
+    text_urls = url_pattern.findall(scan_body)
+    href_urls = _extract_html_link_urls(body)
+    seen_urls, urls_found = set(), []
+    for url in text_urls + href_urls:
+        if url not in seen_urls:
+            seen_urls.add(url)
+            urls_found.append(url)
+        if len(urls_found) >= _MAX_URLS_PER_EMAIL:
+            break
     threat_intel = run_threat_intel(email, urls_found)
 
     try:
         prediction, confidence, url_analysis, header_result, model_score = detector.predict(
-            full, headers=email.get("internetMessageHeaders"))
+            full, headers=email.get("internetMessageHeaders"), extra_urls=href_urls)
         url_analysis, header_result = _make_serializable(url_analysis, header_result)
+        model_score = float(_to_native(model_score))
     except Exception as e:
         import traceback
         traceback.print_exc()
         return None, (jsonify({"error": str(e)}), 500)
 
-    prediction = _to_native(prediction)
-    confidence = _to_native(confidence)
-    if threat_intel["confirmed_phishing"]:
-        prediction = 1
-        confidence = max(confidence, 0.99)
-    if prediction == 1 and threat_intel["confidence_boost"] > 0:
-        confidence = min(1.0, confidence + threat_intel["confidence_boost"])
+    sender = email.get("from", {})
+    if isinstance(sender, dict):
+        from_addr = (sender.get("emailAddress", {}) or {}).get("address", "") or sender.get("address", "")
+    else:
+        from_addr = email.get("sender", "") if isinstance(email.get("sender"), str) else ""
+
+    attachments = _load_attachment_metadata(sess, _message_key(email, idx), email)
+    assessment = _compute_assessment(
+        model_score,
+        full,
+        urls_found,
+        threat_intel.get("url_threats") or {},
+        header_result,
+        threat_intel,
+        detector.structural_analyzer,
+        headers=email.get("internetMessageHeaders"),
+        from_addr=from_addr,
+        attachments=attachments,
+    )
+
+    prediction = int(assessment["verdict"])
+    risk_score = int(assessment["overall"])
+    confidence = risk_score / 100.0 if prediction == 1 else (1.0 - risk_score / 100.0)
 
     message_id = _message_key(email, idx)
     result = {
@@ -2206,7 +2870,9 @@ def _scan_email_common(sess, email, idx):
         "idx": idx,
         "prediction": prediction,
         "confidence": confidence,
-        "model_score": _to_native(model_score),
+        "risk_score": risk_score,
+        "assessment": _to_native(assessment),
+        "model_score": model_score,
         "url_analysis": url_analysis,
         "header_result": header_result,
         "threat_intel": {
