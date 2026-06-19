@@ -1833,6 +1833,89 @@ def _fetch_attachment_bytes(sess, message_id, attachment_id):
     return None
 
 
+def _attachment_name(attachment):
+    """Return a display name for either Graph attachment dicts or mock strings."""
+    if isinstance(attachment, dict):
+        return attachment.get("name") or attachment.get("filename") or "file"
+    return str(attachment or "file")
+
+
+def _classify_attachment(name):
+    """Return (risk, reason): dangerous | caution | safe."""
+    lower = (name or "").lower()
+    parts = [p for p in lower.split(".") if p]
+    ext = parts[-1] if parts else ""
+    dangerous = {"exe", "scr", "bat", "cmd", "com", "ps1", "vbs", "js", "jar", "msi"}
+    caution = {"zip", "rar", "7z", "iso", "img", "docm", "xlsm", "pptm", "html", "htm"}
+
+    if len(parts) >= 2 and parts[-2] in {"pdf", "doc", "docx", "xls", "xlsx"} and ext in dangerous:
+        return "dangerous", f"Double extension - disguised executable (.{parts[-2]}.{ext})."
+    if ext in dangerous:
+        return "dangerous", f"Executable/script file (.{ext}) - can run code if opened."
+    if ext in caution:
+        return "caution", f"Attachment type (.{ext}) deserves extra caution."
+    return "safe", "No risky file type detected."
+
+
+def _load_attachment_metadata(sess, message_id, email):
+    """Fetch and cache Graph attachment metadata for the newer frontend rail."""
+    if email.get("attachments"):
+        return email["attachments"]
+    if not email.get("hasAttachments"):
+        return []
+    if not sess.live_mode or not sess.graph_token["access_token"] or not http_requests:
+        return email.get("attachments", [])
+
+    url = f"{GRAPH_URL}/me/messages/{message_id}/attachments"
+    try:
+        resp = http_requests.get(
+            url,
+            headers={"Authorization": f"Bearer {sess.graph_token['access_token']}"},
+            params={"$select": "id,name,contentType,size"},
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code == 401:
+            sess.graph_token["access_token"] = None
+            sess.graph_token["expiry"] = None
+            return email.get("attachments", [])
+        resp.raise_for_status()
+        attachments = [
+            {
+                "id": item.get("id", ""),
+                "name": item.get("name", "file"),
+                "contentType": item.get("contentType", ""),
+                "size": item.get("size", 0),
+            }
+            for item in (resp.json().get("value") or [])[:25]
+        ]
+        email["attachments"] = attachments
+        return attachments
+    except Exception as exc:
+        print(f"WARNING: attachment metadata fetch failed for {message_id}: {exc}")
+        return email.get("attachments", [])
+
+
+@app.route("/api/messages/<path:message_id>/attachments", methods=["GET"])
+def get_message_attachments(message_id):
+    sess = _current_session()
+    idx, email = _find_email_by_message_id(message_id, sess)
+    if email is None:
+        return jsonify({"error": "Email not found"}), 404
+
+    attachments = _load_attachment_metadata(sess, message_id, email)
+    out = []
+    for attachment in attachments:
+        name = _attachment_name(attachment)
+        risk, reason = _classify_attachment(name)
+        item = {"name": name, "risk": risk, "reason": reason}
+        if isinstance(attachment, dict):
+            item["id"] = attachment.get("id", "")
+            item["size"] = attachment.get("size", 0)
+            item["contentType"] = attachment.get("contentType", "")
+        out.append(item)
+    return jsonify({"attachments": out})
+
+
 @app.route("/api/messages/<path:message_id>/attachments/<path:attachment_id>/analyze", methods=["POST"])
 def analyze_message_attachment(message_id, attachment_id):
     sess = _current_session()
@@ -1896,6 +1979,38 @@ def analyze_message_attachment(message_id, attachment_id):
         "name": name,
         "size": len(content_bytes),
         **result,
+    })
+
+
+@app.route("/api/messages/<path:message_id>/attachments/<path:attachment_id>/deepscan", methods=["POST"])
+def deepscan_message_attachment(message_id, attachment_id):
+    sess = _current_session()
+    idx, email = _find_email_by_message_id(message_id, sess)
+    if email is None:
+        return jsonify({"error": "Email not found"}), 404
+
+    attachment = None
+    for item in email.get("attachments", []) or []:
+        if isinstance(item, dict) and (item.get("id") == attachment_id or item.get("name") == attachment_id):
+            attachment = item
+            break
+
+    name = _attachment_name(attachment or attachment_id)
+    return jsonify({
+        "configured": False,
+        "analyzed": False,
+        "name": name,
+        "message": "Deep attachment uploads are not enabled in this PHISHGUARD build.",
+    })
+
+
+@app.route("/api/messages/<path:message_id>/attachments/<path:attachment_id>/deepscan/<path:analysis_id>", methods=["GET"])
+def deepscan_message_attachment_status(message_id, attachment_id, analysis_id):
+    return jsonify({
+        "configured": False,
+        "analyzed": False,
+        "status": "unavailable",
+        "message": "Deep attachment uploads are not enabled in this PHISHGUARD build.",
     })
 
 

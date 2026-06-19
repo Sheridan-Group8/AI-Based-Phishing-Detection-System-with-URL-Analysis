@@ -1,4 +1,4 @@
-/* ============================================================================
+﻿/* ============================================================================
    PhishGuard Supabase singleton client
 
    Loaded AFTER vendor/supabase.js (which exposes window.supabase) and
@@ -43,14 +43,10 @@
             // automatically.
             persistSession: true,
             autoRefreshToken: true,
-            // OAuth redirects come back via the renderer URL; let supabase-js
-            // pull the token out automatically when it sees it in the hash.
+            // OAuth redirects come back with a short-lived PKCE code. Access
+            // tokens should not appear in URL fragments.
             detectSessionInUrl: true,
-            // 'implicit' flow returns the access token directly in the URL
-            // hash. Avoids the PKCE code-exchange step that, in Electron,
-            // can fail because the popup's localStorage may be isolated
-            // from the main window where the code-verifier was stashed.
-            flowType: 'implicit',
+            flowType: 'pkce',
         },
     });
 
@@ -131,8 +127,8 @@
              away from the app.
            - scopes: Mail.ReadWrite + User.Read for Outlook access;
              offline_access so Supabase stashes a refresh token.
-           - redirectTo: back to our renderer URL. supabase-js detects
-             the session in the URL hash via detectSessionInUrl: true.
+           - redirectTo: back to our renderer URL. supabase-js exchanges
+             the PKCE code via detectSessionInUrl: true.
            Returns { data, error }; caller opens data.url in a window. */
         signInWithMicrosoft: async (overrides) => {
             overrides = overrides || {};
@@ -142,11 +138,11 @@
                     scopes: 'email Mail.ReadWrite User.Read offline_access',
                     redirectTo: overrides.redirectTo || window.location.origin,
                     skipBrowserRedirect: true,
-                    /* prompt=select_account → Microsoft shows the
+                    /* prompt=select_account -> Microsoft shows the
                        account picker. Caller (external-browser flow)
                        overrides redirectTo to point at Flask's
-                       /auth/external-callback so the browser hands
-                       the tokens back to the desktop app. */
+                       /auth/external-callback so the browser returns
+                       only a short-lived PKCE code. */
                     queryParams: {
                         prompt: 'select_account',
                     },
@@ -186,15 +182,14 @@
        Poll for the session to arrive (supabase-js exchanges the PKCE
        code internally) and close as soon as it does. */
     window.pg.isOAuthCallback = (
-        window.location.hash.includes('access_token') ||
         window.location.search.includes('code=') ||
+        window.location.search.includes('error=') ||
         window.location.hash.includes('error')
     );
 
     if (window.pg.isOAuthCallback) {
         console.log('[PhishGuard] OAuth callback popup detected. '
-                    + 'URL search=' + window.location.search.slice(0, 80)
-                    + ' hash=' + window.location.hash.slice(0, 80));
+                    + 'URL search=' + window.location.search.slice(0, 80));
 
         let polls = 0;
         const maxPolls = 30; // 15s total

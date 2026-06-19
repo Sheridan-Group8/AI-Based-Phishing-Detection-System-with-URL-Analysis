@@ -36,3 +36,6 @@ final(supabase_test_updated)/
 PHISHGUARD/phishguard_log.txt
 PHISHGUARD/sender_dna.json
 PHISHGUARD/local_scan_history.json
+final-bigmodeltest
+bigmodel
+final-bigmodeltest\final-bigmodeltest

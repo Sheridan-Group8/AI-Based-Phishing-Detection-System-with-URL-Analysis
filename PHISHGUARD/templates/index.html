@@ -34,9 +34,9 @@
         are blocked by img-src (no https:), so a hostile CSS response can at
         worst restyle the page, not exfiltrate data.
     -->
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
+    <link href="https://fonts.googleapis.com/css2?family=Sora:wght@600;700;800&family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap"
           rel="stylesheet" referrerpolicy="no-referrer" crossorigin="anonymous">
-    <link rel="stylesheet" href="/static/css/style.css?v=96">
+    <link rel="stylesheet" href="/static/css/style.css?v=123">
 </head>
 <body>
 
@@ -110,6 +110,23 @@
             <span class="sidebar-user" id="topbarUser"></span>
         </div>
 
+        <!-- Account card -->
+        <div class="sidebar-account" id="sidebarAccount">
+            <div class="sb-acct-avatar" id="sbAcctAvatar">A</div>
+            <div class="sb-acct-info">
+                <div class="sb-acct-email" id="sbAcctEmail">Not signed in</div>
+                <div class="sb-acct-status" id="sbAcctStatus"><span class="sb-acct-dot"></span>Connected</div>
+            </div>
+        </div>
+
+        <!-- Scan summary -->
+        <div class="sidebar-section-label">Scan Summary</div>
+        <div class="scan-summary">
+            <div class="sumrow sumrow-danger"><span class="sumdot"></span><span class="sumlabel">Dangerous</span><span class="sumval" id="sumDangerous">0</span></div>
+            <div class="sumrow sumrow-warn"><span class="sumdot"></span><span class="sumlabel">Suspicious</span><span class="sumval" id="sumSuspicious">0</span></div>
+            <div class="sumrow sumrow-safe"><span class="sumdot"></span><span class="sumlabel">Safe</span><span class="sumval" id="sumSafe">0</span></div>
+        </div>
+
         <!-- Navigation -->
         <div class="sidebar-section-label">Mailbox</div>
         <div class="sidebar-nav">
@@ -129,6 +146,15 @@
                 </svg>
                 <span class="sidebar-label">Threats</span>
                 <span class="sidebar-tooltip">Threats</span>
+            </button>
+            <button class="sidebar-btn" data-nav="suspicious" id="navSuspicious">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="10"/>
+                    <line x1="12" y1="8" x2="12" y2="12"/>
+                    <line x1="12" y1="16" x2="12.01" y2="16"/>
+                </svg>
+                <span class="sidebar-label">Suspicious</span>
+                <span class="sidebar-tooltip">Suspicious</span>
             </button>
             <button class="sidebar-btn" data-nav="safe" id="navSafe">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -237,40 +263,27 @@
             <div class="scan-progress-bar" id="scanProgressBar"></div>
         </div>
 
-        <!-- Invisible topbar element for JS compatibility -->
+        <!-- Top bar: global search + actions (mockup layout) -->
         <header class="topbar" id="topbar">
-            <!-- Top bar content inside the main content flow -->
-            <div class="topbar-left">
-                <h1 class="topbar-title">Inbox</h1>
+            <div class="topbar-search">
+                <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                </svg>
+                <input type="text" class="search-input" id="searchInput" placeholder="Search emails..." autocomplete="off">
+                <button class="search-clear" id="searchClear" title="Clear search">&times;</button>
+                <div class="search-autocomplete" id="searchAutocomplete" style="display:none;"></div>
             </div>
-            <div class="topbar-center">
-                <button class="btn btn-ghost btn-sm" id="refreshBtn" title="Refresh emails">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <polyline points="23 4 23 10 17 10"/>
-                        <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/>
-                    </svg>
-                    Refresh
+            <div class="topbar-actions">
+                <button class="btn btn-ghost btn-sm" id="scanAllBtn" title="Scan all emails">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+                    Rescan
                 </button>
-                <button class="btn btn-primary btn-sm" id="scanAllBtn" title="Scan all emails">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <circle cx="12" cy="12" r="10"/>
-                        <path d="M12 6v6l4 2"/>
-                    </svg>
-                    Scan All
+                <!-- Refresh kept (icon-only) + hidden stat mirrors for JS -->
+                <button class="btn btn-ghost btn-sm topbar-icon-only" id="refreshBtn" title="Refresh emails">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
                 </button>
-                <div class="topbar-stats" id="topbarStats">
-                    <span class="stat-chip" id="statScanned" title="Emails scanned">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
-                        <span id="statScannedNum">0</span> scanned
-                    </span>
-                    <span class="stat-chip stat-chip-danger" id="statThreats" title="Threats detected">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-                        <span id="statThreatsNum">0</span> threats
-                    </span>
-                    <span class="stat-chip stat-chip-success" id="statSafe" title="Safe emails">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-                        <span id="statSafeNum">0</span> safe
-                    </span>
+                <div class="topbar-stats" id="topbarStats" style="display:none;">
+                    <span id="statScannedNum">0</span><span id="statThreatsNum">0</span><span id="statSafeNum">0</span>
                 </div>
             </div>
         </header>
@@ -280,20 +293,9 @@
 
             <!-- ======= LEFT PANEL (email table) — floating card ======= -->
             <div class="left-panel" id="leftPanel">
-                <div class="search-wrapper">
-                    <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <circle cx="11" cy="11" r="8"/>
-                        <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-                    </svg>
-                    <input type="text" class="search-input" id="searchInput" placeholder="Search... (from: has: is:)" autocomplete="off">
-                    <button class="search-clear" id="searchClear" title="Clear search">&times;</button>
-                    <div class="search-autocomplete" id="searchAutocomplete" style="display:none;"></div>
-                </div>
-                <div class="email-table-header">
-                    <span class="eth-col eth-subject">Subject</span>
-                    <span class="eth-col eth-date">Date</span>
-                    <span class="eth-col eth-sender">Sender</span>
-                    <span class="eth-col eth-score">AI Threat Score</span>
+                <div class="list-header">
+                    <span class="list-title" id="listTitle">Inbox</span>
+                    <span class="list-count" id="listCount">0</span>
                 </div>
                 <div class="email-list" id="emailList">
                     <!-- Email rows rendered by JS -->
@@ -477,74 +479,24 @@
                         </div>
                         <div class="header-viewer" id="headerViewer" style="display:none;">
                             <button class="header-toggle" id="headerToggle"><svg class="header-chevron" id="headerChevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>Email Authentication</button>
-                            <div class="header-details" id="headerDetails" style="display:none;"><div class="header-row" id="headerSPF"><span class="header-label">SPF</span><span class="header-value" id="headerSPFVal"></span></div><div class="header-row" id="headerDKIM"><span class="header-label">DKIM</span><span class="header-value" id="headerDKIMVal"></span></div><div class="header-row" id="headerDMARC"><span class="header-label">DMARC</span><span class="header-value" id="headerDMARCVal"></span></div><div class="raw-headers"><div class="raw-headers-head"><span class="header-label">All Headers</span><span class="raw-header-count" id="rawHeaderCount"></span></div><div class="raw-header-list" id="rawHeaderList"></div></div></div>
+                            <div class="header-details" id="headerDetails" style="display:none;"><div class="header-row" id="headerSPF"><span class="header-label">SPF</span><span class="header-value" id="headerSPFVal"></span></div><div class="header-row" id="headerDKIM"><span class="header-label">DKIM</span><span class="header-value" id="headerDKIMVal"></span></div><div class="header-row" id="headerDMARC"><span class="header-label">DMARC</span><span class="header-value" id="headerDMARCVal"></span></div></div>
                         </div>
 
-                        <!-- Inline Scan Results -->
+                        <!-- Inline Scan Results — unified assessment, rendered by
+                             renderAssessment(): verdict header + 3 expandable
+                             dimension cards (Content / Links / Sender) + actions. -->
                         <div class="scan-results" id="scanResults" style="display:none;">
-
-                            <!-- Risk Overview Bars -->
-                            <div class="risk-overview" id="riskOverview">
-                                <h3 class="section-heading">Risk Assessment</h3>
-                                <div class="risk-bar-group">
-                                    <div class="risk-bar-row">
-                                        <span class="risk-bar-label">Content</span>
-                                        <div class="risk-bar-track">
-                                            <div class="risk-bar-fill" id="riskContent"></div>
-                                        </div>
-                                        <span class="risk-bar-pct" id="riskContentPct">0%</span>
-                                    </div>
-                                    <div class="risk-bar-row">
-                                        <span class="risk-bar-label">Links</span>
-                                        <div class="risk-bar-track">
-                                            <div class="risk-bar-fill" id="riskLinks"></div>
-                                        </div>
-                                        <span class="risk-bar-pct" id="riskLinksPct">0%</span>
-                                    </div>
-                                    <div class="risk-bar-row">
-                                        <span class="risk-bar-label">Sender</span>
-                                        <div class="risk-bar-track">
-                                            <div class="risk-bar-fill" id="riskSender"></div>
-                                        </div>
-                                        <span class="risk-bar-pct" id="riskSenderPct">0%</span>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <!-- Verdict Card -->
-                            <div class="verdict-card" id="verdictCard">
-                                <div class="verdict-icon" id="verdictIcon"></div>
-                                <div class="verdict-text" id="verdictText"></div>
-                                <div class="verdict-confidence" id="verdictConfidence"></div>
-                            </div>
-
-                            <!-- Why Flagged -->
-                            <div class="result-section" id="whyFlagged">
-                                <h3 class="section-heading" id="whyFlaggedTitle"></h3>
-                                <ul class="reason-list" id="reasonList"></ul>
-                            </div>
-
-                            <!-- Link Safety -->
-                            <div class="result-section" id="linkSafety" style="display:none;">
-                                <h3 class="section-heading">URL Analysis</h3>
-                                <div class="link-cards" id="linkCards"></div>
-                            </div>
-
-                            <!-- Sender Verification -->
-                            <div class="result-section" id="senderVerification">
-                                <h3 class="section-heading">Authentication Status</h3>
-                                <div class="verification-rows" id="verificationRows"></div>
-                            </div>
-
-                            <!-- Recommendations -->
-                            <div class="result-section" id="recommendations">
-                                <h3 class="section-heading">Recommended Actions</h3>
-                                <ul class="reco-list" id="recoList"></ul>
-                            </div>
+                            <div class="assess" id="assessRoot"></div>
                         </div>
 
                         <!-- Email actions: always visible at the bottom of any email
                              preview, regardless of scan state or verdict. -->
+                        <!-- Links found in the body (mockup's LINKS section) -->
+                        <div class="preview-links" id="previewLinks" style="display:none;">
+                            <div class="preview-links-head"><span id="previewLinksCount">Links</span></div>
+                            <div class="preview-links-list" id="previewLinksList"></div>
+                        </div>
+
                         <div class="email-actions" id="emailActions">
                             <button class="btn btn-action btn-action-junk" id="moveToJunkBtn">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -557,6 +509,14 @@
                     </div>
                 </div>
             </div>
+            <!-- ============ ANALYSIS RAIL (right) ============ -->
+            <aside class="analysis-rail" id="analysisRail">
+                <div class="rail-empty" id="railEmpty">
+                    <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L3 7v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5z"/><path d="M9 12l2 2 4-4"/></svg>
+                    <p>Select an email and scan it to see the full threat analysis here.</p>
+                </div>
+                <div class="rail-content" id="railContent" style="display:none;"></div>
+            </aside>
         </div>
     </div>
 
@@ -615,6 +575,21 @@
                             </span>
                         </span>
                     </label>
+                </div>
+
+                <!-- Color Theme -->
+                <div class="settings-section">
+                    <label class="settings-label">Color Theme</label>
+                    <div class="theme-swatches" id="themeSwatches">
+                        <button class="theme-swatch" data-theme="indigo" style="--sw-grad:linear-gradient(135deg,#8B93FF,#6E76F2,#B388FF)"><span class="theme-swatch-name">Indigo</span></button>
+                        <button class="theme-swatch" data-theme="mono" style="--sw-grad:linear-gradient(135deg,#C7CCDD,#8A90A8,#5C6080)"><span class="theme-swatch-name">Mono</span></button>
+                        <button class="theme-swatch" data-theme="emerald" style="--sw-grad:linear-gradient(135deg,#34D399,#10B981,#22D3EE)"><span class="theme-swatch-name">Emerald</span></button>
+                        <button class="theme-swatch" data-theme="ocean" style="--sw-grad:linear-gradient(135deg,#38BDF8,#3B82F6,#22D3EE)"><span class="theme-swatch-name">Ocean</span></button>
+                        <button class="theme-swatch" data-theme="sunset" style="--sw-grad:linear-gradient(135deg,#FB923C,#F43F5E,#FBBF24)"><span class="theme-swatch-name">Sunset</span></button>
+                        <button class="theme-swatch" data-theme="rose" style="--sw-grad:linear-gradient(135deg,#FB7185,#EC4899,#C084FC)"><span class="theme-swatch-name">Rose</span></button>
+                        <button class="theme-swatch" data-theme="cyber" style="--sw-grad:linear-gradient(135deg,#22D3EE,#A855F7,#F472B6)"><span class="theme-swatch-name">Cyber</span></button>
+                        <button class="theme-swatch" data-theme="gold" style="--sw-grad:linear-gradient(135deg,#F5B642,#E0962A,#FCD34D)"><span class="theme-swatch-name">Gold</span></button>
+                    </div>
                 </div>
 
                 <!-- Font Size -->
@@ -690,9 +665,9 @@
          2. Config exposes window.SUPABASE_CONFIG (project URL + anon key)
          3. Client module wraps them as window.pg.{supabase,auth}
          4. app.js consumes window.pg, never window.supabase directly -->
-    <script src="/static/js/vendor/supabase.js?v=96"></script>
-    <script src="/static/js/supabase-config.js?v=96"></script>
-    <script src="/static/js/supabase-client.js?v=96"></script>
-    <script src="/static/js/app.js?v=96"></script>
+    <script src="/static/js/vendor/supabase.js?v=123"></script>
+    <script src="/static/js/supabase-config.js?v=123"></script>
+    <script src="/static/js/supabase-client.js?v=123"></script>
+    <script src="/static/js/app.js?v=123"></script>
 </body>
 </html>

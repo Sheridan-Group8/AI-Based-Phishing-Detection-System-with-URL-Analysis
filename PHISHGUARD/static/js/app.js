@@ -1,4 +1,4 @@
-/* ================================================================
+﻿/* ================================================================
    PhishGuard Web Dashboard — Complete SPA JavaScript
    ================================================================ */
 
@@ -41,11 +41,8 @@ const state = {
     savedAccounts: [],
     user: null,                  // current Supabase user (set by onChange)
     supabaseJwt: null,           // forwarded to Flask so it can call Supabase as the user
-    /* Stash for the external-browser Microsoft sign-in: the
-       provider_token comes from the OAuth callback URL fragment and is
-       NOT carried by client.auth.setSession() into the session object.
-       The poll handler drops it here, the SIGNED_IN handler picks it
-       up. */
+    /* Stash for provider tokens returned by the Supabase PKCE code exchange.
+       They stay in memory only long enough to be forwarded to Flask. */
     pendingProviderToken: null,
     csrfToken: '',               // fetched from /api/csrf before any POST
     launchSecret: '',            // from window.electron (passed via preload) if present
@@ -98,6 +95,41 @@ async function apiFetch(url, opts) {
     opts.credentials = opts.credentials || 'same-origin';
     return fetch(url, opts);
 }
+
+/* Hover tooltips for any element carrying a [data-tip] attribute. Rendered at
+   body level (position: fixed) so they never clip inside scrolling panels like
+   the analysis rail, and clamped to the viewport. */
+(function initTips() {
+    let tipEl = null;
+    function show(el) {
+        if (!tipEl) {
+            tipEl = document.createElement('div');
+            tipEl.className = 'pg-tip';
+            document.body.appendChild(tipEl);
+        }
+        tipEl.textContent = el.getAttribute('data-tip') || '';
+        tipEl.style.display = 'block';
+        const r = el.getBoundingClientRect();
+        const tw = tipEl.offsetWidth, th = tipEl.offsetHeight;
+        let left = Math.max(8, Math.min(r.left + r.width / 2 - tw / 2, window.innerWidth - tw - 8));
+        let top = r.top - th - 9;
+        if (top < 8) top = r.bottom + 9;           // flip below if no room above
+        tipEl.style.left = left + 'px';
+        tipEl.style.top = top + 'px';
+        requestAnimationFrame(() => { if (tipEl) tipEl.classList.add('show'); });
+    }
+    function hide() {
+        if (tipEl) { tipEl.classList.remove('show'); tipEl.style.display = 'none'; }
+    }
+    document.addEventListener('mouseover', (e) => {
+        const el = e.target.closest && e.target.closest('[data-tip]');
+        if (el) show(el);
+    });
+    document.addEventListener('mouseout', (e) => {
+        const el = e.target.closest && e.target.closest('[data-tip]');
+        if (el) hide();
+    });
+})();
 
 /* ======================== MESSAGE-ID HELPERS ======================== */
 
@@ -330,6 +362,14 @@ function extractDomain(email) {
     return email.substring(atIdx + 1).toLowerCase();
 }
 
+function domainMatches(domain, allowedDomains) {
+    const clean = String(domain || '').toLowerCase().replace(/\.$/, '');
+    return allowedDomains.some(base => {
+        const expected = String(base || '').toLowerCase().replace(/\.$/, '');
+        return clean === expected || clean.endsWith('.' + expected);
+    });
+}
+
 /* Convert a URL into a visually defanged form so it cannot be copy-pasted
    and accidentally clicked downstream. http(s):// → hxxp(s)://, every dot
    becomes [.], and @ becomes [@]. The original URL stays in data-url so
@@ -353,33 +393,6 @@ function getExtension(filename) {
 function isRiskyExtension(filename) {
     const ext = getExtension(filename);
     return RISKY_EXTENSIONS.includes(ext);
-}
-
-function getUrlList(result) {
-    /* Normalize url_analysis from backend into an array of {url, features, risk} objects */
-    const ua = result.url_analysis;
-    if (!ua) return [];
-    if (Array.isArray(ua)) return ua;  /* already an array */
-    const urls = ua.urls_found || [];
-    const features = ua.features || {};
-    const prob = ua.url_model_prob;
-    return urls.map(url => {
-        const feats = features[url] || {};
-        /* Count how many risk features are flagged */
-        const riskFlags = ['has_ip_address', 'suspicious_tld', 'is_shortened',
-            'has_brand_in_subdomain', 'has_suspicious_keyword', 'has_port',
-            'double_slash_redirect', 'has_at_symbol'];
-        let riskyCount = 0;
-        for (const f of riskFlags) {
-            if (feats[f]) riskyCount++;
-        }
-        const isHttps = feats.is_https || false;
-        let risk = 'low';
-        if (prob !== undefined && prob > 0.7) risk = 'high';
-        else if (riskyCount >= 2) risk = 'high';
-        else if (riskyCount === 1 || !isHttps) risk = 'medium';
-        return { url, features: feats, risk, is_phishing: risk === 'high' };
-    });
 }
 
 /* Write text into a single-line truncated element and only mark it as
@@ -473,15 +486,17 @@ function randomTip() {
 async function loadEmails() {
     setStatus('Loading emails...', 'scanning');
 
-    // Show skeleton placeholders while fetching
-    const skeletonHtml = Array(6).fill(
+    // Show skeleton placeholders while fetching — mirror the real
+    // table columns (star | subject | date | sender | score ring) so
+    // the layout doesn't jump when real rows arrive.
+    const skeletonHtml = Array(7).fill(
         '<div class="email-row skeleton-row">' +
-        '<div class="skeleton skeleton-avatar"></div>' +
-        '<div class="email-row-content">' +
-        '<div class="skeleton skeleton-line skeleton-line-short"></div>' +
-        '<div class="skeleton skeleton-line"></div>' +
-        '<div class="skeleton skeleton-line skeleton-line-long"></div>' +
-        '</div></div>'
+        '<span class="etr-star"><span class="skeleton sk-dot"></span></span>' +
+        '<span class="etr-subject"><span class="skeleton sk-bar"></span></span>' +
+        '<span class="etr-date"><span class="skeleton sk-bar sk-bar-sm"></span></span>' +
+        '<span class="etr-sender"><span class="skeleton sk-bar"></span></span>' +
+        '<span class="etr-score"><span class="skeleton sk-ring"></span></span>' +
+        '</div>'
     ).join('');
     document.getElementById('emailList').innerHTML = skeletonHtml;
 
@@ -495,6 +510,7 @@ async function loadEmails() {
         // and refreshes. Only explicit sign-out clears them.
         state.selectedIdx = null;
         updateStatsFromResults();
+        listAnimateNext = true;
         renderEmailList();
         document.getElementById('emailPreview').style.display = 'none';
         document.getElementById('dashboardView').style.display = '';
@@ -625,16 +641,22 @@ async function getReputation(domain, idx) {
 
 function updateStatsFromResults() {
     let scanned = 0, threats = 0, safe = 0;
-    for (const key in state.scanResults) {
+    // Sidebar Scan Summary tiers (by risk score): Dangerous / Suspicious / Safe.
+    // Count over the emails actually IN the current list (not every stored scan
+    // result) so the counts match the Threats/Suspicious/Safe views — otherwise
+    // restored or junk-folder results inflate the numbers.
+    let dangerous = 0, suspicious = 0, safeTier = 0;
+    for (let i = 0; i < state.emails.length; i++) {
+        const r = scanResultFor(i);
+        if (!r) continue;
         scanned++;
-        const r = state.scanResults[key];
-        if (r.prediction === 1) {
-            threats++;
-        } else {
-            safe++;
-        }
+        if (r.prediction === 1) threats++; else safe++;
+        const rs = riskScoreOf(r);
+        if (rs >= 65) dangerous++;
+        else if (rs >= 40) suspicious++;
+        else safeTier++;
     }
-    state.stats = { scanned, threats, safe };
+    state.stats = { scanned, threats, safe, dangerous, suspicious, safeTier };
     renderStats();
 }
 
@@ -646,6 +668,12 @@ function renderStats() {
     document.getElementById('dashScanned').textContent = state.stats.scanned;
     document.getElementById('dashThreats').textContent = state.stats.threats;
     document.getElementById('dashSafe').textContent = state.stats.safe;
+
+    // Sidebar Scan Summary
+    const setTxt = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
+    setTxt('sumDangerous', state.stats.dangerous || 0);
+    setTxt('sumSuspicious', state.stats.suspicious || 0);
+    setTxt('sumSafe', state.stats.safeTier || 0);
 
     updateSecurityScore();
 }
@@ -812,10 +840,12 @@ function isPriorityWarn(email) {
     const hasUrgency = URGENCY_WORDS.some(w => subject.includes(w));
     const suspiciousTlds = ['.xyz', '.top', '.click', '.buzz', '.net'];
     const hasSuspiciousTld = suspiciousTlds.some(t => sender.endsWith(t));
+    const domain = extractDomain(sender);
     const hasMismatch = /paypal|microsoft|apple|amazon|chase|google/.test(sender) &&
-        !sender.endsWith('paypal.com') && !sender.endsWith('microsoft.com') &&
-        !sender.endsWith('apple.com') && !sender.endsWith('amazon.com') &&
-        !sender.endsWith('chase.com') && !sender.endsWith('google.com');
+        !domainMatches(domain, [
+            'paypal.com', 'microsoft.com', 'apple.com',
+            'amazon.com', 'chase.com', 'google.com',
+        ]);
 
     return (authFailed && (hasUrgency || hasSuspiciousTld)) || hasMismatch;
 }
@@ -890,6 +920,12 @@ function showSearchAutocomplete(query) {
 
 /* ======================== EMAIL LIST RENDERING ======================== */
 
+/* When true, the next renderEmailList() staggers the rows in with a
+   short cascade. Set by loadEmails/loadJunkEmails/setNav (fresh list
+   contexts) and cleared after one render so re-renders triggered by
+   selection or starring don't replay the animation. */
+let listAnimateNext = false;
+
 function renderEmailList() {
     const container = document.getElementById('emailList');
     const searchVal = document.getElementById('searchInput').value.toLowerCase().trim();
@@ -940,24 +976,40 @@ function renderEmailList() {
         });
     }
 
+    // Threats / Suspicious / Safe match the colored labels the user sees:
+    // red (>=65) / yellow (40-64) / green (<40), by the same risk score.
     if (state.navView === 'threats') {
         filtered = filtered.filter(({ idx }) => {
             const r = scanResultFor(idx);
-            return r && (r.prediction === 1);
+            return r && riskScoreOf(r) >= 65;
+        });
+    } else if (state.navView === 'suspicious') {
+        filtered = filtered.filter(({ idx }) => {
+            const r = scanResultFor(idx);
+            if (!r) return false;
+            const v = riskScoreOf(r);
+            return v >= 40 && v < 65;
         });
     } else if (state.navView === 'safe') {
         filtered = filtered.filter(({ idx }) => {
             const r = scanResultFor(idx);
-            return r && (r.prediction === 0);
+            return r && riskScoreOf(r) < 40;
         });
     } else if (state.navView === 'starred') {
         filtered = filtered.filter(({ idx }) => isStarred(idx));
     }
 
+    const _navTitles = { inbox: 'Inbox', threats: 'Threats', suspicious: 'Suspicious', safe: 'Safe', starred: 'Starred', junk: 'Junk' };
+    const _lt = document.getElementById('listTitle');
+    if (_lt) _lt.textContent = _navTitles[state.navView] || 'Inbox';
+    const _lc = document.getElementById('listCount');
+    if (_lc) _lc.textContent = filtered.length;
+
     if (filtered.length === 0) {
         container.innerHTML = '<div style="padding:30px 16px;text-align:center;color:var(--text3);font-size:12px;">' +
             (searchVal ? 'No emails match your search.' :
              state.navView === 'threats' ? 'No threats detected.' :
+             state.navView === 'suspicious' ? 'No suspicious emails.' :
              state.navView === 'safe' ? 'No safe emails yet.' :
              state.navView === 'junk' ? 'Junk folder is empty.' :
              'No emails loaded.') +
@@ -966,6 +1018,7 @@ function renderEmailList() {
     }
 
     let html = '';
+    let renderPos = 0;
     for (const { email, idx } of filtered) {
         const senderName = email.sender_name || email.sender || 'Unknown';
         const subject = email.subject || '(no subject)';
@@ -974,53 +1027,56 @@ function renderEmailList() {
         const isSelected = state.selectedIdx === idx;
         const scanResult = scanResultFor(idx);
 
-        let scoreHtml = '';
-        if (scanResult) {
-            const isPhishing = scanResult.prediction === 1;
-            const confidence = scanResult.confidence !== undefined ? Math.round(scanResult.confidence * 100) : 0;
-            const ringClass = isPhishing ? 'ring-danger' : 'ring-safe';
-            const r = 15;
-            const circ = 2 * Math.PI * r;
-            const filled = (confidence / 100) * circ;
-            scoreHtml = '<span class="etr-score"><div class="score-ring">' +
-                '<svg viewBox="0 0 38 38"><circle class="score-ring-bg" cx="19" cy="19" r="' + r + '"/>' +
-                '<circle class="score-ring-fill ' + ringClass + '" cx="19" cy="19" r="' + r + '" ' +
-                'stroke-dasharray="' + filled.toFixed(1) + ' ' + circ.toFixed(1) + '"/></svg>' +
-                '<span class="score-ring-num ' + ringClass + '">' + confidence + '</span></div></span>';
-        } else {
-            const r = 15;
-            const circ = 2 * Math.PI * r;
-            scoreHtml = '<span class="etr-score"><div class="score-ring">' +
-                '<svg viewBox="0 0 38 38"><circle class="score-ring-bg" cx="19" cy="19" r="' + r + '"/></svg>' +
-                '<span class="score-ring-num ring-none">—</span></div></span>';
-        }
+        const rsv = scanResult ? riskScoreOf(scanResult) : null;
+        const tier = rsv === null ? 'none' : (rsv >= 65 ? 'danger' : (rsv >= 40 ? 'warn' : 'safe'));
+        const STAT = {
+            danger: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+            warn: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
+            safe: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',
+            none: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/></svg>'
+        };
+        const statusIcon = '<span class="er-status er-' + tier + '">' + STAT[tier] + '</span>';
+        const badge = rsv === null ? '' : '<span class="er-score er-' + tier + '">' + rsv + '</span>';
 
         const starred = isStarred(idx);
         const starSvg = starred
-            ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="var(--warning)" stroke="var(--warning)" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>'
-            : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
+            ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="var(--warning)" stroke="var(--warning)" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>'
+            : '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
 
         const priorityWarn = scanResult && scanResult.prediction === 1;
+        const preview = (email.bodyPreview || email.body || '').replace(/\s+/g, ' ').trim();
 
-        const scanBtn = '<span class="etr-action-left"><button class="etr-action-btn" data-quick="scan" data-idx="' + idx + '" title="Scan"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2L3 7v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5z"/></svg></button></span>';
-        const junkBtn = '<span class="etr-action-right"><button class="etr-action-btn" data-quick="junk" data-idx="' + idx + '" title="Move to junk"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg></button></span>';
+        const enterAttrs = listAnimateNext
+            ? ' row-enter" style="animation-delay:' + Math.min(renderPos * 24, 360) + 'ms'
+            : '';
+        renderPos++;
 
         html += '<div class="email-row' +
             (isUnread ? ' unread' : '') +
             (isSelected ? ' selected' : '') +
             (priorityWarn ? ' priority-warn' : '') +
+            ' tier-' + tier +
+            enterAttrs +
             '" data-idx="' + idx + '">' +
-            '<span class="etr-star"><button class="star-btn' + (starred ? ' starred' : '') + '" data-star-idx="' + idx + '" title="Star">' + starSvg + '</button></span>' +
-            '<span class="etr-subject">' + escapeHtml(truncate(subject, 55)) + '</span>' +
-            '<span class="etr-date">' + escapeHtml(date) + '</span>' +
-            '<span class="etr-sender etr-sender-link" data-sender-idx="' + idx + '">' + escapeHtml(truncate(senderName, 28)) + '</span>' +
-            scanBtn +
-            scoreHtml +
-            junkBtn +
+            statusIcon +
+            '<div class="er-main">' +
+                '<div class="er-top">' +
+                    '<span class="er-sender etr-sender-link" data-sender-idx="' + idx + '">' + escapeHtml(truncate(senderName, 24)) + '</span>' +
+                    '<span class="er-meta">' + badge + '<span class="er-date">' + escapeHtml(date) + '</span></span>' +
+                '</div>' +
+                '<div class="er-subject">' + escapeHtml(truncate(subject, 60)) + '</div>' +
+                '<div class="er-preview">' + escapeHtml(truncate(preview, 76)) + '</div>' +
+            '</div>' +
+            '<div class="er-actions">' +
+                '<button class="star-btn' + (starred ? ' starred' : '') + '" data-star-idx="' + idx + '" title="Star">' + starSvg + '</button>' +
+                '<button class="etr-action-btn" data-quick="scan" data-idx="' + idx + '" title="Scan"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2L3 7v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5z"/></svg></button>' +
+                '<button class="etr-action-btn" data-quick="junk" data-idx="' + idx + '" title="Move to junk"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg></button>' +
+            '</div>' +
             '</div>';
     }
 
     container.innerHTML = html;
+    listAnimateNext = false;
 
     container.querySelectorAll('.email-row').forEach(row => {
         row.addEventListener('click', (e) => {
@@ -1107,6 +1163,21 @@ function showEmail(idx) {
     document.getElementById('detailReportToggleWrap').style.display = 'none';
 
     renderAttachments(email);
+    // Attachment metadata isn't in the email-list fetch — pull it lazily the
+    // first time an email with attachments is opened, then re-render.
+    if (email.hasAttachments && !email._attLoaded) {
+        email._attLoaded = true;
+        fetch('/api/messages/' + encodeURIComponent(email.id) + '/attachments',
+              { credentials: 'same-origin' })
+            .then(r => r.json())
+            .then(d => {
+                email.attachments = d.attachments || [];
+                renderAttachments(email);
+                // refresh the rail (attachment count / Files bar) if scanned
+                if (state.selectedIdx === idx && scanResultFor(idx)) showScanResults(idx);
+            })
+            .catch(() => {});
+    }
 
     const bodyEl = document.getElementById('previewBody');
     const bodyHtmlIframe = document.getElementById('previewBodyHtml');
@@ -1151,13 +1222,11 @@ function showEmail(idx) {
     state.detailReportOpen = false;
 
     if (scanResultFor(idx)) {
-        scanBtn.style.display = 'none';
-        showScanBrief(idx);
-        document.getElementById('detailReportToggleWrap').style.display = '';
-        document.getElementById('detailReportBtn').textContent = 'View Detailed Security Report';
+        showScanResults(idx);   // fills report + a "Rescan" button (via showScanBrief)
     } else {
         scanBtn.style.display = '';
         scanBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L3 7v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5z"/></svg> Scan for Phishing';
+        clearAnalysisRail();
     }
 }
 
@@ -1176,12 +1245,23 @@ function renderAttachments(email) {
     let html = '';
     for (const att of attachments) {
         const name = typeof att === 'string' ? att : (att.name || att.filename || 'file');
-        const risky = isRiskyExtension(name);
+        const risk = (att && typeof att === 'object' && att.risk)
+            ? att.risk
+            : (isRiskyExtension(name) ? 'dangerous' : 'safe');
+        const risky = risk !== 'safe';
+        const reason = (att && typeof att === 'object' && att.reason) ? att.reason : '';
+        const tierCls = risk === 'dangerous' ? ' risky' : (risk === 'caution' ? ' caution' : '');
         const vt = vtMap[name];
         let vtBadge = '';
         if (vt) {
             if (vt.status === 'scanning') {
                 vtBadge = '<span class="vt-status vt-scanning" title="Analyzing on VirusTotal">scanning…</span>';
+            } else if (vt.status === 'deepscanning') {
+                vtBadge = '<span class="vt-status vt-scanning" title="Uploading & analyzing on VirusTotal">'
+                    + (vt.phase === 'analyzing' ? 'analyzing…' : 'uploading…') + '</span>';
+            } else if (vt.status === 'pending_timeout') {
+                vtBadge = '<span class="vt-status vt-unknown" title="' + escapeHtml(vt.message || '') + '">'
+                    + 'analyzing…</span>';
             } else if (vt.analyzed && typeof vt.malicious === 'number' && vt.malicious > 0) {
                 vtBadge = '<span class="vt-status vt-malicious" title="Click for details">'
                     + vt.malicious + '/' + (vt.total || 0) + ' flagged</span>';
@@ -1190,7 +1270,9 @@ function renderAttachments(email) {
                     + 'clean</span>';
             } else if (vt.analyzed && !vt.found) {
                 vtBadge = '<span class="vt-status vt-unknown" title="Hash not in VirusTotal database">'
-                    + 'unknown</span>';
+                    + 'unknown</span>'
+                    + '<button class="vt-deepscan" data-att="' + escapeHtml(name)
+                    + '" title="Upload this file to VirusTotal for a fresh scan. Sends the file&#39;s contents to VirusTotal.">Deep scan</button>';
             } else if (vt.configured === false) {
                 vtBadge = '<span class="vt-status vt-disabled" title="' + escapeHtml(vt.message || '') + '">'
                     + 'VT off</span>';
@@ -1199,7 +1281,8 @@ function renderAttachments(email) {
                     + 'scan error</span>';
             }
         }
-        html += '<span class="attachment-badge' + (risky ? ' risky' : '') + '">' +
+        html += '<span class="attachment-badge' + tierCls + '"' +
+            (reason ? ' title="' + escapeHtml(reason) + '"' : '') + '>' +
             '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>' +
             (risky ? '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>' : '') +
             escapeHtml(name) +
@@ -1207,6 +1290,65 @@ function renderAttachments(email) {
             '</span>';
     }
     list.innerHTML = html;
+    // Wire the per-file "Deep scan" buttons (shown on VT "unknown" results).
+    list.querySelectorAll('.vt-deepscan').forEach(btn => {
+        btn.addEventListener('click', () => deepScanAttachment(email, btn.dataset.att));
+    });
+}
+
+/* User-initiated DEEP scan of one attachment: upload it to VirusTotal for a
+   fresh analysis (only reached from the "unknown" badge). This sends the file
+   CONTENTS to VT, so it never runs automatically. Polls until the analysis
+   completes, then renders the verdict like any other VT result. */
+async function deepScanAttachment(email, name) {
+    const messageId = email.id || email.messageId;
+    if (!messageId) return;
+    const att = (email.attachments || []).find(
+        a => (typeof a === 'string' ? a : (a.name || a.filename)) === name);
+    const attId = (att && typeof att === 'object' && (att.id || att.name)) || name;
+    email._vt_results = email._vt_results || {};
+    email._vt_results[name] = { status: 'deepscanning', phase: 'uploading' };
+    renderAttachments(email);
+
+    const base = '/api/messages/' + encodeURIComponent(messageId)
+        + '/attachments/' + encodeURIComponent(attId) + '/deepscan';
+    let data;
+    try {
+        const res = await apiFetch(base, { method: 'POST' });
+        data = await res.json();
+    } catch (e) {
+        email._vt_results[name] = { error: 'upload failed' };
+        renderAttachments(email);
+        return;
+    }
+    // Hash turned out to be known, or the upload failed / not possible.
+    if (data.error || data.configured === false || data.analyzed === false
+        || (data.uploaded === false && data.analyzed)) {
+        email._vt_results[name] = data;
+        renderAttachments(email);
+        return;
+    }
+    // Uploaded → poll the analysis until VT finishes (spaced to respect the
+    // 4-req/min free tier).
+    const analysisId = data.analysis_id;
+    email._vt_results[name] = { status: 'deepscanning', phase: 'analyzing' };
+    renderAttachments(email);
+    for (let i = 0; i < 6; i++) {
+        await new Promise(r => setTimeout(r, 18000));
+        try {
+            const res = await apiFetch(base + '/' + encodeURIComponent(analysisId),
+                { method: 'GET' });
+            const pd = await res.json();
+            if (pd.analyzed || pd.error) {
+                email._vt_results[name] = pd;
+                renderAttachments(email);
+                return;
+            }
+        } catch (e) { /* transient — keep polling */ }
+    }
+    email._vt_results[name] = { status: 'pending_timeout',
+        message: 'Still analyzing on VirusTotal — reopen the email shortly to see the result.' };
+    renderAttachments(email);
 }
 
 /* Analyze every attachment on this email against VirusTotal.
@@ -1248,242 +1390,23 @@ async function analyzeEmailAttachments(email) {
     }
 }
 
-async function renderReputation(email) {
-    const panel = document.getElementById('reputationPanel');
-    const senderAddr = email.sender || '';
-    const domain = extractDomain(senderAddr);
-
-    if (!domain) {
-        panel.style.display = 'none';
-        return;
-    }
-
-    panel.style.display = 'block';
-    document.getElementById('repDomain').textContent = domain;
-    document.getElementById('repGaugeValue').textContent = '--';
-    document.getElementById('repVerdict').textContent = 'Checking...';
-    document.getElementById('repBadge').textContent = '';
-    document.getElementById('repBadge').className = 'rep-badge';
-
-    setGaugeArc(0, 'var(--border)');
-
-    const repData = await getReputation(domain);
-    if (repData && repData.score !== undefined) {
-        const score = Math.round(repData.score * 100);
-        document.getElementById('repGaugeValue').textContent = score;
-
-        let color, verdict, badgeClass, badgeText;
-        if (score >= 70) {
-            color = 'var(--success)';
-            verdict = 'This domain has a good reputation.';
-            badgeClass = 'rep-badge rep-badge-trusted';
-            badgeText = 'Trusted';
-        } else if (score >= 40) {
-            color = 'var(--warning)';
-            verdict = 'This domain has a mixed reputation.';
-            badgeClass = 'rep-badge rep-badge-caution';
-            badgeText = 'Caution';
-        } else {
-            color = 'var(--danger)';
-            verdict = 'This domain has a poor reputation.';
-            badgeClass = 'rep-badge rep-badge-suspicious';
-            badgeText = 'Suspicious';
-        }
-
-        setGaugeArc(score, color);
-        document.getElementById('repVerdict').textContent = verdict;
-        const badgeEl = document.getElementById('repBadge');
-        badgeEl.className = badgeClass;
-        badgeEl.textContent = badgeText;
-    } else {
-        document.getElementById('repGaugeValue').textContent = '?';
-        document.getElementById('repVerdict').textContent = 'Reputation data unavailable.';
-        const badgeEl = document.getElementById('repBadge');
-        badgeEl.className = 'rep-badge rep-badge-caution';
-        badgeEl.textContent = 'Unknown';
-    }
-}
-
-function setGaugeArc(percent, color) {
-    const arc = document.getElementById('repGaugeArc');
-    const pct = Math.max(0, Math.min(100, percent));
-    arc.style.background = 'conic-gradient(' +
-        color + ' 0% ' + pct + '%, ' +
-        'var(--border) ' + pct + '% 100%)';
-}
-
-async function renderHeaders(email) {
-    const viewer = document.getElementById('headerViewer');
-    const details = document.getElementById('headerDetails');
-    const chevron = document.getElementById('headerChevron');
-    const headers = email.headers || null;
-    const rawList = document.getElementById('rawHeaderList');
-    const rawCount = document.getElementById('rawHeaderCount');
-
-    if (!headers) {
-        viewer.style.display = 'none';
-        return;
-    }
-
-    viewer.style.display = 'block';
-    details.style.display = 'none';
-    chevron.classList.remove('open');
-
-    setHeaderValue('headerSPFVal', headers.spf || 'none');
-    setHeaderValue('headerDKIMVal', headers.dkim || 'none');
-    setHeaderValue('headerDMARCVal', headers.dmarc || 'none');
-
-    if (rawList) rawList.textContent = 'Loading...';
-    if (rawCount) rawCount.textContent = '';
-
-    const messageId = email.id || email.messageId;
-    if (!messageId) {
-        renderRawHeaders([], 0, false);
-        return;
-    }
-
-    try {
-        const folder = email.folder ? '?folder=' + encodeURIComponent(email.folder) : '';
-        const res = await apiFetch('/api/messages/' + encodeURIComponent(messageId) + '/headers' + folder);
-        if (!res.ok) throw new Error('headers unavailable');
-        const data = await res.json();
-        const selectedId = state.selectedIdx === null ? null : emailIdFromIdx(state.selectedIdx);
-        if (selectedId !== messageId) return;
-        renderRawHeaders(data.headers || [], data.count || 0, !!data.truncated);
-    } catch (e) {
-        if (rawList) rawList.textContent = 'Headers unavailable';
-        if (rawCount) rawCount.textContent = '';
-    }
-}
-
-function renderRawHeaders(headers, count, truncated) {
-    const rawList = document.getElementById('rawHeaderList');
-    const rawCount = document.getElementById('rawHeaderCount');
-    if (!rawList) return;
-
-    rawList.textContent = '';
-    if (rawCount) {
-        const shown = headers.length;
-        rawCount.textContent = shown + (count && count !== shown ? '/' + count : '') + (truncated ? ' shown' : '');
-    }
-
-    if (!headers.length) {
-        rawList.textContent = 'No headers returned';
-        return;
-    }
-
-    for (const h of headers) {
-        const row = document.createElement('div');
-        row.className = 'raw-header-row';
-
-        const name = document.createElement('div');
-        name.className = 'raw-header-name';
-        name.textContent = h.name || '';
-
-        const value = document.createElement('div');
-        value.className = 'raw-header-value';
-        value.textContent = h.value || '';
-
-        row.appendChild(name);
-        row.appendChild(value);
-        rawList.appendChild(row);
-    }
-}
-
-async function renderSenderDna(email, idx) {
-    const panel = document.getElementById('senderDnaPanel');
-    const badge = document.getElementById('dnaBadge');
-    const statusEl = document.getElementById('dnaStatus');
-    const flagsEl = document.getElementById('dnaFlags');
-    const detailsEl = document.getElementById('dnaDetails');
-    const senderAddr = email.sender || '';
-
-    if (!senderAddr) {
-        panel.style.display = 'none';
-        return;
-    }
-
-    panel.style.display = 'block';
-    badge.textContent = 'Analyzing...';
-    badge.className = 'dna-badge dna-badge-unknown';
-    statusEl.textContent = 'Building sender profile...';
-    flagsEl.innerHTML = '';
-    detailsEl.innerHTML = '';
-
-    try {
-        const messageId = emailIdFromIdx(idx) || '';
-        const res = await apiFetch('/api/sender-dna/' + encodeURIComponent(senderAddr) +
-                                '?message_id=' + encodeURIComponent(messageId));
-        const data = await res.json();
-
-        if (data.status === 'unknown' || !data.profile) {
-            badge.textContent = 'New Sender';
-            badge.className = 'dna-badge dna-badge-unknown';
-            statusEl.textContent = 'Not enough data to build a behavioral profile for this sender yet.';
-            return;
-        }
-
-        const profile = data.profile;
-        const comparison = data.comparison;
-
-        if (!comparison || comparison.status === 'insufficient_data') {
-            badge.textContent = 'Profiled';
-            badge.className = 'dna-badge dna-badge-match';
-            statusEl.textContent = 'Sender profile built from ' + profile.email_count + ' email' + (profile.email_count > 1 ? 's' : '') + '.';
-        } else if (comparison.status === 'matches') {
-            badge.textContent = 'Match';
-            badge.className = 'dna-badge dna-badge-match';
-            statusEl.textContent = 'This email matches ' + escapeHtml(senderAddr) + '\'s established writing pattern.';
-        } else if (comparison.status === 'minor_deviation') {
-            badge.textContent = 'Deviation';
-            badge.className = 'dna-badge dna-badge-deviation';
-            statusEl.textContent = 'Minor differences from this sender\'s usual pattern detected.';
-        } else if (comparison.status === 'suspicious') {
-            badge.textContent = 'Suspicious';
-            badge.className = 'dna-badge dna-badge-suspicious';
-            statusEl.textContent = 'Significant deviation from this sender\'s known behavior.';
-        }
-
-        // Render flags
-        if (comparison && comparison.flags && comparison.flags.length > 0) {
-            flagsEl.innerHTML = comparison.flags.map(f =>
-                '<div class="dna-flag dna-flag-' + f.severity + '">' +
-                '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>' +
-                escapeHtml(f.message) +
-                '</div>'
-            ).join('');
-        }
-
-        // Render profile details
-        detailsEl.innerHTML =
-            '<div class="dna-detail-row"><span class="dna-detail-label">Emails analyzed</span><span class="dna-detail-value">' + profile.email_count + '</span></div>' +
-            '<div class="dna-detail-row"><span class="dna-detail-label">Avg length</span><span class="dna-detail-value">' + Math.round(profile.avg_word_count) + ' words</span></div>' +
-            '<div class="dna-detail-row"><span class="dna-detail-label">Greeting style</span><span class="dna-detail-value">' + escapeHtml(profile.typical_greeting) + '</span></div>' +
-            '<div class="dna-detail-row"><span class="dna-detail-label">Uses signature</span><span class="dna-detail-value">' + (profile.usually_has_signature ? 'Yes' : 'No') + '</span></div>' +
-            (comparison ? '<div class="dna-detail-row"><span class="dna-detail-label">Deviation score</span><span class="dna-detail-value">' + comparison.score + '/100</span></div>' : '');
-
-    } catch (e) {
-        badge.textContent = 'Error';
-        badge.className = 'dna-badge dna-badge-unknown';
-        statusEl.textContent = 'Could not analyze sender profile.';
-    }
-}
-
-function setHeaderValue(elementId, value) {
-    const el = document.getElementById(elementId);
-    const val = (value || 'none').toLowerCase();
-    el.textContent = val.charAt(0).toUpperCase() + val.slice(1);
-    el.className = 'header-value';
-    if (val === 'pass') {
-        el.classList.add('header-value-pass');
-    } else if (val === 'fail') {
-        el.classList.add('header-value-fail');
-    } else {
-        el.classList.add('header-value-none');
-    }
-}
-
 /* ======================== SCAN RESULTS DISPLAY ======================== */
+
+/* Single source of truth for the 0-100 risk score shown by the ring, the
+   brief, and the verdict card — so they can never show different numbers for
+   the same email. Prefer the backend risk_score; fall back to a verdict-
+   derived value for older restored scans that only carry prediction +
+   confidence. */
+function riskScoreOf(result) {
+    if (!result) return 0;
+    if (result.risk_score !== undefined) return result.risk_score;
+    if (result.confidence !== undefined) {
+        return result.prediction === 1
+            ? Math.round(result.confidence * 100)
+            : Math.round((1 - result.confidence) * 100);
+    }
+    return 0;
+}
 
 function showScanBrief(idx) {
     const result = scanResultFor(idx);
@@ -1491,7 +1414,7 @@ function showScanBrief(idx) {
 
     const email = state.emails[idx];
     const isPhishing = result.prediction === 1;
-    const confidence = result.confidence !== undefined ? Math.round(result.confidence * 100) : null;
+    const riskScore = riskScoreOf(result);
 
     const briefEl = document.getElementById('scanBrief');
     const iconEl = document.getElementById('scanBriefIcon');
@@ -1500,42 +1423,16 @@ function showScanBrief(idx) {
     briefEl.className = 'scan-brief ' + (isPhishing ? 'brief-danger' : 'brief-safe');
     iconEl.textContent = isPhishing ? '\u26A0\uFE0F' : '\u2705';
 
-    let reason = '';
-    const ti = result.threat_intel || {};
-
-    if (isPhishing) {
-        // Prioritize threat intel signals — these are confirmed by external databases
-        if (ti.confirmed) {
-            reason = 'This sender has been confirmed as malicious by external security databases.';
-            if (ti.signals && ti.signals.length > 0) {
-                reason += ' ' + ti.signals[0] + '.';
-            }
-        } else {
-            const bodyText = (email.body || '').toLowerCase();
-            if (URGENCY_WORDS.some(w => bodyText.includes(w))) {
-                reason = 'This email uses urgency-based language commonly found in phishing attacks.';
-            } else if (MONEY_WORDS.some(w => bodyText.includes(w))) {
-                reason = 'This email contains financial terminology typical of phishing scams.';
-            } else {
-                reason = 'The content and structure of this email match known phishing patterns.';
-            }
-            const headers = email.headers || {};
-            if ((headers.spf || '').toLowerCase() === 'fail' || (headers.dkim || '').toLowerCase() === 'fail') {
-                reason += ' Sender authentication has also failed.';
-            }
-        }
-    } else {
-        let safeReason = 'This email appears legitimate.';
-        const checksRun = (ti.checks_run || []).length;
-        if (checksRun > 0) {
-            safeReason += ' Verified against ' + checksRun + ' security databases — no threats found.';
-        }
-        safeReason += ' Sender authentication checks passed.';
-        reason = safeReason;
-    }
+    // Use the assessment's own one-line summary so the brief, the report, and
+    // the score all tell the same story. Fall back for older restored scans.
+    const a = result.assessment;
+    const reason = (a && a.summary)
+        ? a.summary
+        : (isPhishing ? 'This message matches known phishing patterns.'
+                      : 'No phishing indicators were found.');
 
     textEl.textContent = (isPhishing ? 'Threat Identified' : 'No Threats Detected') +
-        (confidence !== null ? ' (' + confidence + '% confidence). ' : '. ') + reason;
+        ' (risk score ' + riskScore + '/100). ' + reason;
 
     briefEl.style.display = 'flex';
 
@@ -1549,439 +1446,225 @@ function showScanBrief(idx) {
         replyWarn.style.display = 'none';
     }
 
-    // Hide scan button, show detail report button
-    document.getElementById('scanBtn').style.display = 'none';
-    document.getElementById('detailReportToggleWrap').style.display = '';
+    // Keep a "Rescan" button visible so the user can re-scan; the detailed
+    // report lives in the always-visible analysis rail.
+    const _sb = document.getElementById('scanBtn');
+    _sb.style.display = '';
+    _sb.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg> Rescan';
+    const drt = document.getElementById('detailReportToggleWrap');
+    if (drt) drt.style.display = 'none';
 }
 
 function showScanResults(idx) {
     const result = scanResultFor(idx);
     if (!result) return;
-
     const email = state.emails[idx];
-    const isPhishing = result.prediction === 1;
-    const confidence = result.confidence !== undefined ? Math.round(result.confidence * 100) : null;
 
-    // Show the brief summary first
+    // Quick summary banner above the body, then the analysis rail + links.
     showScanBrief(idx);
-
-    // Populate the detailed report sections (hidden until toggled)
-    renderRiskOverview(result, email);
-    renderVerdictCard(isPhishing, confidence);
-    renderWhyFlagged(isPhishing, result, email);
-    renderLinkSafety(result);
-    renderSenderVerification(email, result);
-    renderRecommendations(isPhishing, result, email);
-
-    // Email actions are now persistent at the bottom of every preview —
-    // no need to toggle visibility based on the scan verdict.
-
-    // Populate the other report panels
-    renderReputation(email);
-    renderSenderDna(email, idx);
-    renderHeaders(email);
-    renderTrustScore(email, idx);
+    renderAssessment(result, email);
     checkContactMismatch(email);
 }
 
-function renderRiskOverview(result, email) {
-    const bodyText = (email.body || '').toLowerCase();
-    const isPhishing = result.prediction === 1;
+/* ── Unified security report ──────────────────────────────────────────────
+   One renderer for the whole detailed report: a verdict header + three
+   expandable dimension cards (Content / Links / Sender) + recommended
+   actions. Everything is driven by result.assessment, so the report can
+   never disagree with the score. */
+const _ICON_WARN = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>';
+const _ICON_CHECK = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>';
 
-    let contentScore = 0;
-    let linksScore = 0;
-    let senderScore = 0;
-
-    let urgencyCount = 0;
-    for (const word of URGENCY_WORDS) {
-        if (bodyText.includes(word)) urgencyCount++;
-    }
-    let moneyCount = 0;
-    for (const word of MONEY_WORDS) {
-        if (bodyText.includes(word)) moneyCount++;
-    }
-    let threatCount = 0;
-    for (const word of THREAT_WORDS) {
-        if (bodyText.includes(word)) threatCount++;
-    }
-
-    contentScore = Math.min(100, (urgencyCount * 20) + (moneyCount * 15) + (threatCount * 20));
-
-    const urls = getUrlList(result);
-    if (urls.length > 0) {
-        let riskyUrls = 0;
-        for (const u of urls) {
-            if (u.risk === 'high' || u.is_phishing) {
-                riskyUrls++;
-            }
-        }
-        linksScore = urls.length > 0 ? Math.round((riskyUrls / urls.length) * 100) : 0;
-    } else {
-        linksScore = 0;
-    }
-
-    const headers = email.headers || {};
-    const spf = (headers.spf || 'none').toLowerCase();
-    const dkim = (headers.dkim || 'none').toLowerCase();
-    const dmarc = (headers.dmarc || 'none').toLowerCase();
-    let authFails = 0;
-    if (spf === 'fail') authFails++;
-    if (dkim === 'fail') authFails++;
-    if (dmarc === 'fail') authFails++;
-    let authNone = 0;
-    if (spf === 'none') authNone++;
-    if (dkim === 'none') authNone++;
-    if (dmarc === 'none') authNone++;
-    senderScore = Math.min(100, (authFails * 33) + (authNone * 10));
-    if (isPhishing && senderScore < 30) senderScore = 30;
-
-    setRiskBar('riskContent', 'riskContentPct', contentScore);
-    setRiskBar('riskLinks', 'riskLinksPct', linksScore);
-    setRiskBar('riskSender', 'riskSenderPct', senderScore);
+function _dimFindingsHtml(findings) {
+    if (!findings || !findings.length) return '';
+    return '<ul class="dim-findings">' +
+        findings.map(f => '<li>' + escapeHtml(f) + '</li>').join('') + '</ul>';
 }
 
-function setRiskBar(barId, pctId, value) {
-    const bar = document.getElementById(barId);
-    const pct = document.getElementById(pctId);
-    const v = Math.max(0, Math.min(100, Math.round(value)));
-    bar.style.width = v + '%';
-    bar.className = 'risk-bar-fill';
-    if (v <= 33) bar.classList.add('low');
-    else if (v <= 66) bar.classList.add('medium');
-    else bar.classList.add('high');
-    pct.textContent = v + '%';
+function _dimLinksHtml(dim) {
+    let h = _dimFindingsHtml(dim.findings);
+    if (dim.links && dim.links.length) {
+        h += '<div class="dim-links">';
+        for (const l of dim.links) {
+            const shown = (typeof defangUrl === 'function') ? defangUrl(l.url) : l.url;
+            h += '<div class="dim-link dim-' + l.level + '">' +
+                '<div class="dim-link-url">' + escapeHtml(shown) + '</div>' +
+                '<div class="dim-link-foot"><span class="dim-link-badge">' + l.score + '</span>' +
+                '<span class="dim-link-reason">' + escapeHtml(l.reason) + '</span></div>' +
+                '</div>';
+        }
+        h += '</div>';
+    }
+    return h;
 }
 
-function renderVerdictCard(isPhishing, confidence) {
-    const card = document.getElementById('verdictCard');
-    card.className = 'verdict-card ' + (isPhishing ? 'verdict-card-danger' : 'verdict-card-safe');
-
-    document.getElementById('verdictIcon').textContent = isPhishing ? '\u26A0\uFE0F' : '\u2705';
-    document.getElementById('verdictText').textContent = isPhishing ? 'Threat Identified' : 'No Threats Detected';
-
-    const confEl = document.getElementById('verdictConfidence');
-    if (confidence !== null) {
-        confEl.textContent = confidence + '% confidence';
-    } else {
-        confEl.textContent = '';
-    }
+function _dimCardHtml(name, dim, detailHtml, open) {
+    return '<div class="dim-card dim-' + dim.level + (open ? ' open' : '') + '">' +
+        '<button class="dim-head" type="button">' +
+            '<span class="dim-name">' + name + '</span>' +
+            '<span class="dim-cap">' + escapeHtml(dim.summary || '') + '</span>' +
+            '<span class="dim-meter"><span class="dim-meter-fill" style="width:' + dim.score + '%"></span></span>' +
+            '<span class="dim-score">' + dim.score + '</span>' +
+            '<svg class="dim-chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>' +
+        '</button>' +
+        '<div class="dim-detail">' + detailHtml + '</div>' +
+    '</div>';
 }
 
-function renderWhyFlagged(isPhishing, result, email) {
-    const titleEl = document.getElementById('whyFlaggedTitle');
-    const listEl = document.getElementById('reasonList');
-    const bodyText = (email.body || '').toLowerCase();
+const _ICON_INFO_S = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>';
 
-    titleEl.textContent = isPhishing ? 'Threat Indicators' : 'Safety Indicators';
+/* Render the right-hand ANALYSIS RAIL: Threat Score + Header Analysis +
+   Threats Found + Recommended action. Driven entirely by result.assessment. */
+function renderAssessment(result, email) {
+    const rail = document.getElementById('railContent');
+    const railEmpty = document.getElementById('railEmpty');
+    if (!rail) return;
+    const a = result.assessment;
+    const isP = result.prediction === 1;
+    const rs = riskScoreOf(result);
+    const tier = rs >= 65 ? 'tier-danger' : (rs >= 40 ? 'tier-warn' : 'tier-safe');
 
-    const reasons = [];
+    let html = '';
+    // Threat score
+    html += '<div class="rail-section rail-score ' + tier + '">' +
+        '<div class="rail-cap">Threat Score</div>' +
+        '<div class="rail-score-num">' + rs + '</div>' +
+        '<div class="rail-score-tag">' + (rs >= 65 ? 'High threat' : (rs >= 40 ? 'Caution advised' : 'Low risk')) + '</div>' +
+    '</div>';
 
-    // Add threat intelligence signals first (most authoritative)
-    const ti = result.threat_intel || {};
-    if (ti.signals && ti.signals.length > 0) {
-        for (const signal of ti.signals) {
-            reasons.push({text: signal, type: 'danger'});
-        }
+    // Risk breakdown — the Content / Links / Sender bars that make up the score
+    const dims = (a && a.dimensions) || null;
+    if (dims) {
+        const lvlClass = (lv) => lv === 'high' ? 'lvl-high' : (lv === 'elevated' ? 'lvl-elevated' : 'lvl-low');
+        const bar = (label, dim, tip) => {
+            const sc = Math.max(0, Math.min(100, dim.score | 0));
+            return '<div class="rb-row">' +
+                '<span class="rb-label has-tip" data-tip="' + escapeHtml(tip) + '">' + label + '</span>' +
+                '<span class="rb-meter"><span class="rb-fill ' + lvlClass(dim.level) +
+                '" style="width:' + sc + '%"></span></span>' +
+                '<span class="rb-val">' + sc + '</span></div>';
+        };
+        html += '<div class="rail-section"><div class="rail-cap">Risk Breakdown</div>' +
+            bar('Content', dims.content, 'How much the email’s wording reads like phishing — the AI text model plus urgency, credential and money-lure detection.') +
+            bar('Links', dims.links, 'The riskiest link in the email, from the URL model, structural red flags, and threat intelligence (Google Safe Browsing, urlscan, VirusTotal, URLhaus).') +
+            bar('Sender', dims.sender, 'Reputation of the sender’s domain and the IP address the mail was actually sent from.') +
+            (dims.auth ? bar('Auth', dims.auth, 'Whether the email proved who it’s from — SPF/DKIM/DMARC, domain alignment and Reply-To checks.') : '') +
+            (dims.files ? bar('Files', dims.files, 'Risk from attachments, judged by file type and VirusTotal verdict.') : '') +
+        '</div>';
     }
 
-    if (isPhishing) {
-        let foundUrgency = [];
-        for (const word of URGENCY_WORDS) {
-            if (bodyText.includes(word)) foundUrgency.push(word);
-        }
-        if (foundUrgency.length > 0) {
-            reasons.push('Urgency-based language detected: "' + foundUrgency.slice(0, 3).join('", "') + '"');
-        }
+    // Header analysis
+    const hr = (email && email.headers) || result.header_result || {};
+    const authState = (v) => {
+        v = String(v || '').toLowerCase();
+        if (v === 'pass') return ['Pass', 'ha-pass'];
+        if (v === 'fail') return ['Fail', 'ha-fail'];
+        return ['Missing', 'ha-none'];
+    };
+    const spf = authState(hr.spf), dkim = authState(hr.dkim), dmarc = authState(hr.dmarc);
+    const anyFail = [spf, dkim, dmarc].some(x => x[1] === 'ha-fail');
+    const allPass = [spf, dkim, dmarc].every(x => x[1] === 'ha-pass');
+    const domainAuth = anyFail ? ['Fail', 'ha-fail'] : (allPass ? ['Pass', 'ha-pass'] : ['Partial', 'ha-none']);
+    const links = (a && a.dimensions && a.dimensions.links && a.dimensions.links.links) || [];
+    const linksCount = links.length || ((result.url_analysis && result.url_analysis.urls_found || []).length);
+    const attachCount = (email && email.attachments && email.attachments.length) || 0;
+    const haRow = (label, st, tip) => {
+        const lbl = tip
+            ? '<span class="ha-label has-tip" data-tip="' + escapeHtml(tip) + '">' + label + '</span>'
+            : '<span class="ha-label">' + label + '</span>';
+        return '<div class="ha-row">' + lbl + '<span class="ha-val ' + st[1] + '">' + st[0] + '</span></div>';
+    };
+    // Deeper sender-identity checks from the Auth dimension: does the visible
+    // From align with the authenticated domain, and does Reply-To point elsewhere.
+    const authDim = (a && a.dimensions && a.dimensions.auth) || {};
+    const authDetail = authDim.detail || {};
+    const alignSt = authDetail.aligned === true ? ['Aligned', 'ha-pass']
+        : (authDetail.aligned === false ? ['Misaligned', 'ha-fail'] : ['Unknown', 'ha-none']);
+    const replySt = authDetail.reply_to_mismatch ? ['Mismatch', 'ha-fail'] : ['OK', 'ha-pass'];
+    const providerSignal = authDetail.provider_signal || null;
+    const providerSt = providerSignal
+        ? [providerSignal.label || 'Flagged',
+            providerSignal.status === 'fail' ? 'ha-fail' : 'ha-warn']
+        : null;
+    html += '<div class="rail-section"><div class="rail-cap">Header Analysis</div>' +
+        haRow('Domain Auth', domainAuth, 'The combined result of the email’s SPF, DKIM and DMARC checks — “Pass” means all that were present passed.') +
+        haRow('DKIM', dkim, 'DKIM (DomainKeys Identified Mail): a cryptographic signature proving the message genuinely came from the domain and wasn’t altered in transit.') +
+        haRow('SPF', spf, 'SPF (Sender Policy Framework): checks the server that sent the mail is one the domain authorised to send on its behalf.') +
+        haRow('DMARC', dmarc, 'DMARC: ties the SPF/DKIM results to the visible “From” domain and tells receivers what to do when they fail.') +
+        '<div class="ha-sep"></div>' +
+        haRow('Domain Alignment', alignSt, 'Whether the visible “From” domain matches the domain that actually passed authentication. A mismatch is a common sign of spoofing.') +
+        haRow('Reply-To', replySt, 'Whether a reply would go to a different domain than the sender. Phishers often set Reply-To to an address they control.') +
+        (providerSt ? haRow('Provider Signal', providerSt, providerSignal.message || 'Microsoft mail protection added an additional authentication or spam-confidence signal.') : '') +
+        '<div class="ha-sep"></div>' +
+        haRow('Links Checked', [linksCount, 'ha-num'], 'How many links were extracted from this email and checked against the threat-intelligence sources.') +
+        haRow('Attachments', [attachCount, 'ha-num'], 'How many file attachments this email has. Each is judged by type and checked on VirusTotal.') +
+    '</div>';
 
-        let foundMoney = [];
-        for (const word of MONEY_WORDS) {
-            if (bodyText.includes(word)) foundMoney.push(word);
+    // Threats found
+    const threats = (a && a.threats) || [];
+    if (threats.length) {
+        html += '<div class="rail-section"><div class="rail-cap">Threats Found (' + threats.length + ')</div>';
+        for (const t of threats) {
+            html += '<div class="threat-card threat-' + (t.severity || 'medium') + '">' +
+                '<div class="threat-title"><span class="threat-dot"></span>' + escapeHtml(t.title) + '</div>' +
+                '<div class="threat-desc">' + escapeHtml(t.desc) + '</div></div>';
         }
-        if (foundMoney.length > 0) {
-            reasons.push('Financial terminology identified: "' + foundMoney.slice(0, 3).join('", "') + '"');
-        }
+        html += '</div>';
+    }
 
-        let foundThreat = [];
-        for (const word of THREAT_WORDS) {
-            if (bodyText.includes(word)) foundThreat.push(word);
-        }
-        if (foundThreat.length > 0) {
-            reasons.push('Coercive or threatening language present: "' + foundThreat.slice(0, 2).join('", "') + '"');
-        }
-
-        const urls = getUrlList(result);
-        let riskyCount = 0;
-        for (const u of urls) {
-            if (u.risk === 'high' || u.is_phishing) {
-                riskyCount++;
-            }
-        }
-        if (riskyCount > 0) {
-            reasons.push(riskyCount + ' high-risk URL' + (riskyCount > 1 ? 's' : '') + ' identified in message body');
-        }
-
-        const headers = email.headers || {};
-        const spf = (headers.spf || 'none').toLowerCase();
-        const dkim = (headers.dkim || 'none').toLowerCase();
-        const dmarc = (headers.dmarc || 'none').toLowerCase();
-        let failedAuths = [];
-        if (spf === 'fail') failedAuths.push('SPF');
-        if (dkim === 'fail') failedAuths.push('DKIM');
-        if (dmarc === 'fail') failedAuths.push('DMARC');
-        if (failedAuths.length > 0) {
-            reasons.push('Email authentication failed: ' + failedAuths.join(', ') + ' verification unsuccessful');
-        }
-
-        const attachments = email.attachments || [];
-        let riskyAttachments = 0;
-        for (const att of attachments) {
-            const name = typeof att === 'string' ? att : (att.name || att.filename || '');
-            if (isRiskyExtension(name)) riskyAttachments++;
-        }
-        if (riskyAttachments > 0) {
-            reasons.push(riskyAttachments + ' high-risk attachment' + (riskyAttachments > 1 ? 's' : '') + ' detected (executable or macro-enabled)');
-        }
-
-        if (reasons.length === 0) {
-            reasons.push('Content structure and phrasing are consistent with known phishing techniques.');
-        }
+    // Recommended action
+    const actions = (a && a.actions) || [];
+    html += '<div class="rail-section rail-reco"><div class="reco-head">' + _ICON_INFO_S + ' Recommended action</div>';
+    if (actions.length) {
+        html += '<ul>' + actions.map(x => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul>';
     } else {
-        const headers = email.headers || {};
-        const spf = (headers.spf || 'none').toLowerCase();
-        const dkim = (headers.dkim || 'none').toLowerCase();
-        const dmarc = (headers.dmarc || 'none').toLowerCase();
-        let passedAuths = [];
-        if (spf === 'pass') passedAuths.push('SPF');
-        if (dkim === 'pass') passedAuths.push('DKIM');
-        if (dmarc === 'pass') passedAuths.push('DMARC');
-        if (passedAuths.length > 0) {
-            reasons.push('Sender identity verified: ' + passedAuths.join(', ') + ' authentication passed');
-        }
-
-        let urgencyFound = false;
-        for (const word of URGENCY_WORDS) {
-            if (bodyText.includes(word)) { urgencyFound = true; break; }
-        }
-        if (!urgencyFound) {
-            reasons.push('No urgency-based or coercive language detected in the message body.');
-        }
-
-        const urls = getUrlList(result);
-        let allSafe = true;
-        for (const u of urls) {
-            if (u.risk === 'high' || u.is_phishing) {
-                allSafe = false;
-                break;
-            }
-        }
-        if (urls.length > 0 && allSafe) {
-            reasons.push('All ' + urls.length + ' embedded URL' + (urls.length > 1 ? 's have' : ' has') + ' been verified as low-risk.');
-        } else if (urls.length === 0) {
-            reasons.push('No embedded URLs detected in the message body.');
-        }
-
-        reasons.push('Message content does not correspond to any known phishing signatures.');
+        html += '<div class="reco-safe">No action needed — this message looks safe.</div>';
     }
+    html += '</div>';
 
-    listEl.innerHTML = reasons.map(r => {
-        const text = typeof r === 'object' ? r.text : r;
-        const cls = (typeof r === 'object' && r.type === 'danger') ? ' class="reason-danger"' : '';
-        return '<li' + cls + '>' + escapeHtml(text) + '</li>';
+    rail.innerHTML = html;
+    rail.style.display = '';
+    if (railEmpty) railEmpty.style.display = 'none';
+
+    renderReadingLinks(result);
+}
+
+/* Reset the rail to its empty state (no scan yet for the open email). */
+function clearAnalysisRail() {
+    const rail = document.getElementById('railContent');
+    const railEmpty = document.getElementById('railEmpty');
+    if (rail) { rail.innerHTML = ''; rail.style.display = 'none'; }
+    if (railEmpty) railEmpty.style.display = '';
+    const pl = document.getElementById('previewLinks');
+    if (pl) pl.style.display = 'none';
+}
+
+/* Reading-pane LINKS section — the links found in the email body. */
+function renderReadingLinks(result) {
+    const wrap = document.getElementById('previewLinks');
+    const list = document.getElementById('previewLinksList');
+    const cnt = document.getElementById('previewLinksCount');
+    if (!wrap || !list) return;
+    const a = result && result.assessment;
+    const links = (a && a.dimensions && a.dimensions.links && a.dimensions.links.links) || [];
+    if (!links.length) { wrap.style.display = 'none'; return; }
+    if (cnt) cnt.textContent = 'Links (' + links.length + ')';
+    list.innerHTML = links.map(l => {
+        const shown = (typeof defangUrl === 'function') ? defangUrl(l.url) : l.url;
+        const cls = l.level === 'high' ? 'pl-danger' : (l.level === 'elevated' ? 'pl-warn' : 'pl-safe');
+        // Per-source threat-intel results (Google Safe Browsing / urlscan / etc.)
+        const checks = (l.factors && l.factors.checks) || [];
+        const badges = checks.map(c => {
+            const rc = (c.result === 'flagged' || c.result === 'malicious') ? 'plc-bad'
+                : (c.result === 'suspicious' ? 'plc-warn'
+                : (c.result === 'unknown' ? 'plc-neutral' : 'plc-ok'));
+            return '<span class="pl-check ' + rc + '">' + escapeHtml(c.src) +
+                ' <b>' + escapeHtml(c.result) + '</b></span>';
+        }).join('');
+        return '<div class="pl-item ' + cls + '"><div class="pl-url">' + escapeHtml(shown) +
+            '</div><div class="pl-reason">' + escapeHtml(l.reason || '') + '</div>' +
+            (badges ? '<div class="pl-checks">' + badges + '</div>' : '') + '</div>';
     }).join('');
-}
-
-function renderLinkSafety(result) {
-    const section = document.getElementById('linkSafety');
-    const container = document.getElementById('linkCards');
-    const urls = getUrlList(result);
-
-    if (urls.length === 0) {
-        section.style.display = 'none';
-        return;
-    }
-
-    section.style.display = 'block';
-    let html = '';
-    for (const u of urls) {
-        const url = u.url || u.link || '';
-        let riskLevel, riskClass, desc;
-
-        if (u.risk === 'high' || u.is_phishing) {
-            riskLevel = 'High Risk';
-            riskClass = 'dangerous';
-            desc = u.reason || 'This URL exhibits characteristics consistent with phishing or malicious activity.';
-        } else if (u.risk === 'medium') {
-            riskLevel = 'Elevated Risk';
-            riskClass = 'suspicious';
-            desc = u.reason || 'This URL contains atypical patterns that warrant caution before proceeding.';
-        } else {
-            riskLevel = 'Low Risk';
-            riskClass = 'safe';
-            desc = u.reason || 'No indicators of malicious intent were identified for this URL.';
-        }
-
-        html += '<div class="link-card">' +
-            '<div class="link-card-url">' + escapeHtml(url) + '</div>' +
-            '<div class="link-card-risk ' + riskClass + '">' + riskLevel + '</div>' +
-            '<div class="link-card-desc">' + escapeHtml(desc) + '</div>' +
-            '</div>';
-    }
-    container.innerHTML = html;
-}
-
-function renderSenderVerification(email, result) {
-    const container = document.getElementById('verificationRows');
-    const headers = email.headers || {};
-
-    const checks = [
-        {
-            key: 'spf',
-            name: 'SPF (Sender Policy Framework)',
-            desc: 'Verifies the sending server is authorized'
-        },
-        {
-            key: 'dkim',
-            name: 'DKIM (DomainKeys Identified Mail)',
-            desc: 'Verifies the email was not altered in transit'
-        },
-        {
-            key: 'dmarc',
-            name: 'DMARC (Domain-based Message Authentication)',
-            desc: 'Ensures SPF and DKIM alignment'
-        }
-    ];
-
-    // Icon-only verdicts — green check / red X / dim dash. Each variant
-    // gets the same circular badge with a different glyph and tint so
-    // the row scans at a glance.
-    const ICON_PASS = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
-    const ICON_FAIL = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
-    const ICON_NONE = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>';
-
-    let html = '';
-    for (const check of checks) {
-        const val = (headers[check.key] || 'none').toLowerCase();
-        let statusClass, icon, label;
-        if (val === 'pass') {
-            statusClass = 'verification-status verification-status-pass';
-            icon = ICON_PASS;
-            label = 'Authentication passed';
-        } else if (val === 'fail') {
-            statusClass = 'verification-status verification-status-fail';
-            icon = ICON_FAIL;
-            label = 'Authentication failed';
-        } else {
-            statusClass = 'verification-status verification-status-none';
-            icon = ICON_NONE;
-            label = 'No record';
-        }
-
-        html += '<div class="verification-row">' +
-            '<div>' +
-            '<div class="verification-name">' + escapeHtml(check.name) + '</div>' +
-            '<div class="verification-desc">' + escapeHtml(check.desc) + '</div>' +
-            '</div>' +
-            '<span class="' + statusClass + '" title="' + label + '" aria-label="' + label + '">' +
-            icon +
-            '</span>' +
-            '</div>';
-    }
-
-    container.innerHTML = html;
-}
-
-function renderRecommendations(isPhishing, result, email) {
-    const list = document.getElementById('recoList');
-    const recommendations = [];
-
-    if (isPhishing) {
-        recommendations.push('Avoid interacting with any links or downloading attachments from this message.');
-        recommendations.push('Do not reply to this message or disclose any personal or financial information.');
-        recommendations.push('Report this message to your IT security team or email service provider.');
-
-        const attachments = email.attachments || [];
-        if (attachments.length > 0) {
-            recommendations.push('If any attachments were downloaded, remove them from your device immediately.');
-        }
-
-        recommendations.push('If you have already interacted with this message, update your credentials and review recent account activity.');
-    } else {
-        recommendations.push('This message has passed our security analysis. Exercise standard caution with any requests for sensitive data.');
-        recommendations.push('Confirm the sender\'s identity independently before sharing confidential information.');
-        recommendations.push('Ensure your security software and email client are kept up to date.');
-    }
-
-    list.innerHTML = recommendations.map((r, i) =>
-        '<li data-num="' + (i + 1) + '">' + escapeHtml(r) + '</li>'
-    ).join('');
-}
-
-/* ======================== TRUST SCORE (Feature 1) ======================== */
-
-function renderTrustScore(email, idx) {
-    const badge = document.getElementById('trustScoreBadge');
-    const numEl = document.getElementById('trustScoreNum');
-    const fillEl = document.getElementById('trustScoreFill');
-    const labelEl = document.getElementById('trustScoreLabel');
-    const detailEl = document.getElementById('trustScoreDetail');
-
-    badge.style.display = 'flex';
-
-    // Calculate trust score from available signals
-    let score = 50; // baseline
-    let factors = [];
-
-    // Header auth
-    const headers = email.headers || {};
-    let authPasses = 0;
-    let authTotal = 0;
-    for (const key of ['spf', 'dkim', 'dmarc']) {
-        const val = (headers[key] || 'none').toLowerCase();
-        if (val === 'pass') { authPasses++; authTotal++; }
-        else if (val === 'fail') { authTotal++; }
-        else { authTotal++; }
-    }
-    const authScore = authTotal > 0 ? (authPasses / authTotal) : 0.5;
-    score += (authScore - 0.5) * 30;
-    if (authPasses === 3) factors.push('Authentication verified');
-    else if (authPasses === 0 && authTotal > 0) factors.push('Authentication failed');
-
-    // Scan result
-    const scanResult = scanResultFor(idx);
-    if (scanResult) {
-        if (scanResult.prediction === 1) {
-            score -= 30 * scanResult.confidence;
-            factors.push('Phishing indicators detected');
-        } else {
-            score += 20 * scanResult.confidence;
-            factors.push('No phishing indicators found');
-        }
-    }
-
-    // Domain check (simple heuristic from sender address)
-    const addr = (email.sender || '').toLowerCase();
-    const domain = addr.split('@')[1] || '';
-    const trustedDomains = ['gmail.com','outlook.com','yahoo.com','company.com','amazon.com','chase.com','apple.com','google.com','microsoft.com'];
-    if (trustedDomains.includes(domain)) {
-        score += 10;
-    } else if (domain.includes('-') && domain.includes('.')) {
-        score -= 10;
-    }
-
-    score = Math.max(0, Math.min(100, Math.round(score)));
-
-    // Set colors
-    let color, label;
-    if (score >= 70) { color = 'var(--success)'; label = 'Verified Sender'; }
-    else if (score >= 40) { color = 'var(--warning)'; label = 'Proceed with Caution'; }
-    else { color = 'var(--danger)'; label = 'Elevated Threat Level'; }
-
-    numEl.textContent = score;
-    fillEl.style.strokeDasharray = score + ', 100';
-    fillEl.style.stroke = color;
-    numEl.style.color = color;
-    labelEl.textContent = label;
-    detailEl.textContent = factors.join(' \u00b7 ') || 'Preliminary assessment';
+    wrap.style.display = '';
 }
 
 /* ======================== CONTACT MISMATCH (Feature 5) ======================== */
@@ -2017,7 +1700,7 @@ function checkContactMismatch(email) {
 
     for (const [brand, domains] of Object.entries(brands)) {
         if (name.includes(brand)) {
-            if (!domains.includes(domain)) {
+            if (!domainMatches(domain, domains)) {
                 mismatch = true;
                 brandName = brand.charAt(0).toUpperCase() + brand.slice(1);
                 expectedDomains = domains;
@@ -2042,7 +1725,7 @@ function setTheme(name) {
     localStorage.setItem('pg-theme', name);
 
     document.querySelectorAll('.theme-swatch').forEach(sw => {
-        sw.classList.toggle('active', sw.getAttribute('data-theme') === name);
+        sw.classList.toggle('selected', sw.getAttribute('data-theme') === name);
     });
 }
 
@@ -2079,8 +1762,9 @@ function loadPreferences() {
     const savedMode = localStorage.getItem('pg-mode');
     const savedFontSize = localStorage.getItem('pg-fontSize');
 
-    if (savedTheme) setTheme(savedTheme);
-    else setTheme('cupertino');
+    // 'indigo' is the default (no override → mode-block accents). Older saved
+    // values like 'cupertino' simply fall through to the default palette.
+    setTheme(savedTheme || 'indigo');
 
     if (savedMode) setMode(savedMode);
     else setMode('dark');
@@ -2134,6 +1818,14 @@ async function checkAuthStatus() {
             document.getElementById('popupCurrentName').textContent = data.user_name || 'User';
             document.getElementById('popupCurrentEmail').textContent = data.user_email || '';
 
+            /* Sidebar account card (mockup) */
+            const _acctEmail = document.getElementById('sbAcctEmail');
+            if (_acctEmail) _acctEmail.textContent = data.user_email || data.user_name || 'Connected';
+            const _acctAv = document.getElementById('sbAcctAvatar');
+            if (_acctAv) _acctAv.textContent = ((data.user_name || data.user_email || 'A').trim()[0] || 'A').toUpperCase();
+            const _acctSt = document.getElementById('sbAcctStatus');
+            if (_acctSt) _acctSt.innerHTML = '<span class="sb-acct-dot"></span>Connected';
+
             /* Try loading profile photo */
             const avatar = document.getElementById('profileAvatar');
             const popupAvatar = document.getElementById('popupCurrentAvatar');
@@ -2178,6 +1870,10 @@ async function checkAuthStatus() {
             if (statusEl) statusEl.textContent = '';
             profileSection.style.display = 'none';
             closeProfilePopup();
+            const _ae = document.getElementById('sbAcctEmail');
+            if (_ae) _ae.textContent = 'Not connected';
+            const _as = document.getElementById('sbAcctStatus');
+            if (_as) _as.innerHTML = '<span class="sb-acct-dot off"></span>Offline';
         }
     } catch (e) { /* ignore */ }
 }
@@ -2386,6 +2082,15 @@ async function setNav(view) {
         btn.classList.toggle('active', btn.getAttribute('data-nav') === view);
     });
 
+    /* Keep the topbar title in sync with the active view (it used to
+       stay "Inbox" forever). */
+    const titleEl = document.querySelector('.topbar-title');
+    if (titleEl) {
+        const titles = { inbox: 'Inbox', threats: 'Threats', safe: 'Safe',
+                         starred: 'Starred', junk: 'Junk' };
+        titleEl.textContent = titles[view] || 'Inbox';
+    }
+
     const list = document.getElementById('emailList');
     list.classList.add('fade-out');
     list.classList.remove('fade-in');
@@ -2398,6 +2103,7 @@ async function setNav(view) {
     } else {
         // Inbox-family view to another inbox-family view; same data,
         // different filter.
+        listAnimateNext = true;
         renderEmailList();
     }
 
@@ -2420,6 +2126,7 @@ async function loadJunkEmails() {
         // was wiping the user's scan history every time they clicked
         // Junk.
         state.selectedIdx = null;
+        listAnimateNext = true;
         renderEmailList();
         document.getElementById('emailPreview').style.display = 'none';
         document.getElementById('dashboardView').style.display = '';
@@ -2442,8 +2149,8 @@ async function moveToJunk(idx) {
         const res = await apiFetch('/api/messages/' + encodeURIComponent(messageId) + '/move-to-junk',
                                     { method: 'POST' });
         const data = await res.json();
-        if (!res.ok || data.error || data.ok === false) {
-            setStatus('Failed: ' + (data.error || data.message || 'Could not move email'), 'error');
+        if (data.error) {
+            setStatus('Failed: ' + data.error, 'error');
             return;
         }
         // Graph rewrites the message id when moving folders. Move the
@@ -2520,10 +2227,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         refreshOutlookEmails();
     });
 
-    /* Scan All */
+    /* Rescan (= scan all) */
     document.getElementById('scanAllBtn').addEventListener('click', () => {
         scanAll();
     });
+
+    /* Live scan toggle — auto-scan on open. Persisted. */
 
     /* Scan / Hide toggle */
     document.getElementById('scanBtn').addEventListener('click', () => {
@@ -2547,19 +2256,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Show detailed report — populate if needed
             const result = scanResultFor(state.selectedIdx);
             if (result) {
-                const email = state.emails[state.selectedIdx];
-                const isPhishing = result.prediction === 1;
-                const confidence = result.confidence !== undefined ? Math.round(result.confidence * 100) : null;
-                renderRiskOverview(result, email);
-                renderVerdictCard(isPhishing, confidence);
-                renderWhyFlagged(isPhishing, result, email);
-                renderLinkSafety(result);
-                renderSenderVerification(email, result);
-                renderRecommendations(isPhishing, result, email);
-                renderReputation(email);
-                renderSenderDna(email, state.selectedIdx);
-                renderHeaders(email);
-                renderTrustScore(email, state.selectedIdx);
+                renderAssessment(result);
             }
             scanResults.style.display = 'block';
             state.detailReportOpen = true;
@@ -2588,10 +2285,13 @@ document.addEventListener('DOMContentLoaded', async () => {
                    strict CSP prevents any remote image or stylesheet from being
                    fetched even if the sanitiser misses something. */
                 const safeHtml = sanitizeEmailHtml(htmlContent);
+                /* Match the plain-text body: settings slider value + 2.5px
+                   (the slider used to have no effect on the rich view). */
+                const htmlFontPx = ((state.fontSize || 11) + 2.5) + 'px';
                 const baseStyle =
-                    'body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 13.5px; line-height: 1.55; padding: 0; margin: 0; ' +
-                    (isDark ? 'background: transparent; color: #B0B2CC;' : 'background: transparent; color: #333;') +
-                    ' } a { color: #818CF8; pointer-events: none; text-decoration: underline; }';
+                    'body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; font-size: ' + htmlFontPx + '; line-height: 1.55; padding: 0; margin: 0; ' +
+                    (isDark ? 'background: transparent; color: #ADB0CE;' : 'background: transparent; color: #333;') +
+                    ' } a { color: #8B93FF; pointer-events: none; text-decoration: underline; }';
                 const csp = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'";
                 iframe.srcdoc =
                     '<!DOCTYPE html><html><head>' +
@@ -2656,21 +2356,54 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
+    /* Resolve a link's verdict. Prefer the authoritative per-link score from
+       the scan result (same engine the report uses); fall back to a structural
+       check for links that haven't been scanned yet. Never claim "no threats"
+       on an unscanned link. */
+    function linkVerdictFor(url) {
+        try {
+            const r = scanResultFor(state.selectedIdx);
+            const L = r && r.assessment && r.assessment.dimensions && r.assessment.dimensions.links;
+            if (L && L.links) {
+                for (let i = 0; i < L.links.length; i++) {
+                    if (L.links[i].url === url) {
+                        return { scored: true, level: L.links[i].level, reason: L.links[i].reason };
+                    }
+                }
+            }
+        } catch (e) { /* fall through to heuristic */ }
+        let host = '';
+        try { host = new URL(url.indexOf('://') >= 0 ? url : 'http://' + url).hostname.toLowerCase(); } catch (e) {}
+        const tld = host.indexOf('.') >= 0 ? host.split('.').pop() : '';
+        const RISKY_TLD = {test:1,tk:1,ml:1,ga:1,cf:1,gq:1,xyz:1,top:1,click:1,zip:1,mov:1,buzz:1,work:1,country:1,link:1,review:1,loan:1,men:1,date:1,fit:1,rest:1};
+        if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return { scored:false, level:'high', reason:'Uses a raw IP address instead of a domain name.' };
+        if (url.indexOf('@') >= 0) return { scored:false, level:'high', reason:"Contains an '@' that hides the link's true destination." };
+        if (host.indexOf('xn--') >= 0) return { scored:false, level:'high', reason:'Punycode — a possible look-alike of a real domain.' };
+        if (RISKY_TLD[tld]) return { scored:false, level:'elevated', reason:'Unfamiliar domain on a high-risk top-level domain (.' + tld + ').' };
+        return { scored:false, level:'unknown', reason:'' };
+    }
+
+    const _LP_WARN = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>';
+    const _LP_OK = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>';
+    const _LP_INFO = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>';
+
     function renderLinkPreviewBody(url, revealed) {
         const isHttps = url.startsWith('https');
-        const hasIP = /https?:\/\/\d+\.\d+\.\d+\.\d+/.test(url);
-        const suspicious = /paypa1|m1cr0soft|amaz0n|g00gle|login.*verify|\.xyz|\.top|\.click/.test(url.toLowerCase());
-        const risky = hasIP || suspicious;
+        const v = linkVerdictFor(url);
         const truncate = (s) => (s.length > 80 ? s.slice(0, 80) + '...' : s);
         const display = revealed ? truncate(url) : truncate(defangUrl(url));
         const urlClass = revealed ? 'link-preview-url' : 'link-preview-url link-preview-url-defanged';
-        const verdictIcon = risky
-            ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> High-risk destination'
-            : '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> No threats identified';
+
+        let cls, icon, label;
+        if (v.level === 'high') { cls = 'link-preview-risky'; icon = _LP_WARN; label = 'High-risk destination'; }
+        else if (v.level === 'elevated') { cls = 'link-preview-risky'; icon = _LP_WARN; label = 'Suspicious destination'; }
+        else if (v.scored) { cls = 'link-preview-safe'; icon = _LP_OK; label = 'No threats identified'; }
+        else { cls = 'link-preview-unknown'; icon = _LP_INFO; label = 'Not yet analyzed — run a scan'; }
+
         const verdict =
-            '<div class="link-preview-verdict ' + (risky ? 'link-preview-risky' : 'link-preview-safe') + '">' +
-            verdictIcon + (!isHttps ? ' (unencrypted connection)' : '') +
-            '</div>';
+            '<div class="link-preview-verdict ' + cls + '">' + icon + ' ' + label +
+            (!isHttps ? ' (unencrypted)' : '') + '</div>' +
+            (v.reason ? '<div class="link-preview-reason">' + escapeHtml(v.reason) + '</div>' : '');
         const revealBtn = revealed
             ? '<div class="link-preview-hint">Real link revealed — do not click through.</div>'
             : '<button type="button" class="link-preview-reveal-btn" data-action="reveal">Reveal real URL</button>' +
@@ -2741,12 +2474,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     /* Settings */
     /* Sidebar collapse toggle */
     const collapseBtn = document.getElementById('sidebarCollapseBtn');
-    console.log('[PhishGuard] Collapse button found:', !!collapseBtn);
     if (collapseBtn) {
         collapseBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             e.preventDefault();
-            console.log('[PhishGuard] Collapse button CLICKED');
             const sidebar = document.getElementById('sidebar');
             const mainArea = document.querySelector('.main-area');
             const statusbar = document.querySelector('.statusbar');
@@ -2754,10 +2485,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (mainArea) mainArea.classList.toggle('sidebar-collapsed', collapsed);
             if (statusbar) statusbar.classList.toggle('sidebar-collapsed', collapsed);
             localStorage.setItem('pg-sidebar-collapsed', collapsed ? '1' : '0');
-        });
-        // Also try mousedown in case click is swallowed
-        collapseBtn.addEventListener('mousedown', (e) => {
-            console.log('[PhishGuard] Collapse button MOUSEDOWN');
         });
     }
     // Restore sidebar state
@@ -2911,8 +2638,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
 
-    /* #5 Dismiss splash — let the animation play fully */
-    setTimeout(dismissSplash, 3800);
+    /* #5 Dismiss splash — the fill animation now completes in ~1.3s;
+       holding the user for 3.8s every launch was a paper-cut. */
+    setTimeout(dismissSplash, 1700);
 
     /* ============== Supabase auth bring-up ============== */
     initSupabaseAuth();
@@ -2968,10 +2696,10 @@ function initSupabaseAuth() {
         if (statusEl) statusEl.textContent = '';
     }
 
-    // Sign in with Microsoft — opens the URL in the user's DEFAULT
+    // Sign in with Microsoft - opens the URL in the user's DEFAULT
     // browser so they can leverage an existing Microsoft session (the
     // "click the signed-in account" UX). Flask serves a small callback
-    // page that hands the tokens back to this Electron renderer.
+    // page that stores a short-lived PKCE code for this renderer to exchange.
     const msBtn = document.getElementById('pgSignInMicrosoftBtn');
     if (msBtn) {
         msBtn.addEventListener('click', async () => {
@@ -3004,8 +2732,8 @@ function initSupabaseAuth() {
     }
 
     // Reconnect-Outlook button — only shown when Supabase session is
-    // active but Flask has no Outlook provider token (e.g. session
-    // restored from localStorage but `pg-provider` was empty/expired).
+    // active but Flask has no Outlook provider token. Provider tokens are
+    // not restored from renderer storage, so the user must reconnect Outlook.
     const reconnectBtn = document.getElementById('pgReconnectBtn');
     if (reconnectBtn) {
         reconnectBtn.addEventListener('click', async () => {
@@ -3050,7 +2778,7 @@ function initSupabaseAuth() {
             state.savedAccounts = [];
             state.scanResults = {};
             state.stats = { scanned: 0, threats: 0, safe: 0 };
-            try { localStorage.removeItem('pg-provider'); } catch (e) {}
+            try { localStorage.removeItem('pg-provider'); } catch (e) {} // legacy cleanup
             renderStats();
             renderEmailList();
             renderPopupAccounts('');
@@ -3061,8 +2789,7 @@ function initSupabaseAuth() {
 
     // Initial check — show modal if there's no session on boot. If
     // there IS a session, the SIGNED_IN/INITIAL_SESSION event from
-    // onChange handles all the loading paths (including reading the
-    // persisted provider_token from localStorage). We just set the
+    // onChange handles all the loading paths. We just set the
     // basic state + indicator here so they appear immediately.
     window.pg.auth.currentSession().then(async (session) => {
         if (!session) {
@@ -3127,8 +2854,6 @@ async function handleSupabaseSignIn(session) {
     } else if (state.pendingProviderToken) {
         providerInfo = state.pendingProviderToken;
         state.pendingProviderToken = null;
-    } else {
-        providerInfo = readStoredProviderInfo();
     }
     console.log('[PhishGuard] handleSupabaseSignIn: providerInfo',
         providerInfo ? 'present' : 'NULL');
@@ -3225,11 +2950,11 @@ function hideSignedInIndicator() {
      3. Ask main to open that URL in the user's default browser
         (window.electron.openExternal).
      4. The user signs in in their browser (where they're already
-        signed into Microsoft — that's the whole point). Microsoft
-        redirects to Supabase → Supabase redirects to Flask's
-        callback page → page POSTs tokens to /api/auth/external-deliver.
+        signed into Microsoft - that's the whole point). Microsoft
+        redirects to Supabase, then Supabase redirects to Flask's
+        callback page with a short-lived PKCE code.
      5. Meanwhile this renderer polls /api/auth/external-poll until
-        tokens land, then installs them via supabase.auth.setSession.
+        the code lands, then exchanges it with supabase.auth.
      6. The standard onAuthStateChange listener handles the rest of
         the sign-in flow (load starred, forward provider token, etc.). */
 async function startExternalMicrosoftSignIn(statusEl) {
@@ -3238,7 +2963,7 @@ async function startExternalMicrosoftSignIn(statusEl) {
         return false;
     }
     const nonce = pgGenerateNonce();
-    // Register the nonce so /api/auth/external-deliver will accept it.
+    // Register the nonce so /auth/external-callback will accept it.
     let start;
     try {
         start = await apiFetch('/api/auth/external-start', {
@@ -3318,46 +3043,77 @@ async function pgPollExternalSession(nonce, statusEl) {
         }
         if (data.status === 'ready' && data.access_token) {
             try {
-                // Stash the Outlook provider tokens BEFORE setSession so
-                // the SIGNED_IN handler that fires from setSession can
-                // forward them to Flask — they're not carried inside the
-                // Supabase JWT and setSession won't put them on the
-                // session object.
+                const { data: sessData, error } =
+                    await window.pg.supabase.auth.setSession({
+                        access_token: data.access_token,
+                        refresh_token: data.refresh_token || '',
+                    });
+                if (error) {
+                    state.pendingProviderToken = null;
+                    console.warn('[PhishGuard] external token install failed:', error);
+                    if (statusEl) statusEl.textContent = 'Session install failed';
+                    return false;
+                }
+                const newSession = sessData && sessData.session;
+                if (!newSession) {
+                    state.pendingProviderToken = null;
+                    if (statusEl) statusEl.textContent = 'No session returned';
+                    return false;
+                }
                 if (data.provider_token) {
                     state.pendingProviderToken = {
                         provider_token: data.provider_token,
                         provider_refresh_token: data.provider_refresh_token || '',
-                        expires_in: data.expires_in || 3600,
+                        expires_in: data.expires_in || newSession.expires_in || 3600,
                     };
                 }
-                const { data: sessData, error } = await window.pg.supabase.auth.setSession({
-                    access_token: data.access_token,
-                    refresh_token: data.refresh_token || '',
-                });
-                if (error) {
-                    state.pendingProviderToken = null;
-                    console.warn('[PhishGuard] external setSession failed:', error);
-                    if (statusEl) statusEl.textContent = 'Session install failed';
-                    return false;
-                }
-                // Don't rely on supabase-js to fire SIGNED_IN — empirically
-                // it fires TOKEN_REFRESHED (or nothing at all) when the
-                // in-memory client still has a session from before. Drive
-                // the sign-in side-effects directly.
-                const newSession = (sessData && sessData.session) || {
-                    user: { id: '', email: '' },
-                    access_token: data.access_token,
-                    provider_token: data.provider_token || '',
-                    provider_refresh_token: data.provider_refresh_token || '',
-                    expires_in: data.expires_in || 3600,
-                };
-                console.log('[PhishGuard] setSession OK; running handleSupabaseSignIn directly');
+                console.log('[PhishGuard] external token install OK; running handleSupabaseSignIn directly');
                 await handleSupabaseSignIn(newSession);
                 return true;
             } catch (e) {
                 state.pendingProviderToken = null;
-                console.error('[PhishGuard] setSession threw:', e);
+                console.error('[PhishGuard] external token install threw:', e);
                 if (statusEl) statusEl.textContent = 'Session install error';
+                return false;
+            }
+        }
+        if (data.status === 'ready' && data.code) {
+            try {
+                const { data: sessData, error } =
+                    await window.pg.supabase.auth.exchangeCodeForSession(data.code);
+                if (error) {
+                    state.pendingProviderToken = null;
+                    console.warn('[PhishGuard] external code exchange failed:', error);
+                    if (statusEl) statusEl.textContent = 'Session exchange failed';
+                    return false;
+                }
+                const newSession = sessData && sessData.session;
+                if (!newSession) {
+                    state.pendingProviderToken = null;
+                    if (statusEl) statusEl.textContent = 'No session returned';
+                    return false;
+                }
+                // Some supabase-js versions expose provider tokens at the
+                // response root rather than on the session. Keep them in
+                // memory only long enough for handleSupabaseSignIn to forward.
+                if (!newSession.provider_token && sessData.provider_token) {
+                    state.pendingProviderToken = {
+                        provider_token: sessData.provider_token,
+                        provider_refresh_token: sessData.provider_refresh_token || '',
+                        expires_in: newSession.expires_in || 3600,
+                    };
+                }
+                // Don't rely on supabase-js to fire SIGNED_IN - empirically
+                // it fires TOKEN_REFRESHED (or nothing at all) when the
+                // in-memory client still has a session from before. Drive
+                // the sign-in side-effects directly.
+                console.log('[PhishGuard] code exchange OK; running handleSupabaseSignIn directly');
+                await handleSupabaseSignIn(newSession);
+                return true;
+            } catch (e) {
+                state.pendingProviderToken = null;
+                console.error('[PhishGuard] code exchange threw:', e);
+                if (statusEl) statusEl.textContent = 'Session exchange error';
                 return false;
             }
         }
@@ -3393,11 +3149,11 @@ function signOutOfPhishGuard() {
     state._lastSignInUserId = null;
     state._lastSignInAt = 0;
 
-    // 2. Clear localStorage entries: our pg-provider key plus every
+    // 2. Clear localStorage entries: legacy pg-provider plus every
     //    Supabase auth-token key (`sb-<projectRef>-auth-token`). Doing
     //    this directly — instead of calling supabase.auth.signOut() —
     //    avoids the race described in the docstring.
-    try { localStorage.removeItem('pg-provider'); } catch (e) {}
+    try { localStorage.removeItem('pg-provider'); } catch (e) {} // legacy cleanup
     try {
         for (let i = localStorage.length - 1; i >= 0; i--) {
             const key = localStorage.key(i);
@@ -3483,13 +3239,22 @@ async function loadScanHistoryFromSupabase() {
         for (const row of data || []) {
             if (restored[row.message_id]) continue; // older duplicate
             const sigs = row.signals || {};
+            // The full assessment is persisted in signals (since this update),
+            // so restored scans show the complete report without rescanning.
+            // Older rows have no assessment → fall back to verdict-only.
+            const assessment = sigs.assessment || null;
+            const riskScore = (typeof sigs.risk_score === 'number')
+                ? sigs.risk_score
+                : (assessment && typeof assessment.overall === 'number' ? assessment.overall : undefined);
             restored[row.message_id] = {
                 id: row.message_id,
                 messageId: row.message_id,
                 prediction: row.prediction,
                 confidence: row.confidence,
+                risk_score: riskScore,
+                assessment: assessment,
                 url_analysis: null,
-                header_result: null,
+                header_result: sigs.header_result || null,
                 threat_intel: {
                     confirmed: Boolean(sigs.confirmed),
                     signals: Array.isArray(sigs.intel_signals) ? sigs.intel_signals : [],
@@ -3525,28 +3290,13 @@ async function loadScanHistoryFromSupabase() {
 }
 
 /* Forward Outlook provider tokens to Flask so it can call Graph on the
-   user's behalf. Used by both auth paths:
-     • in-renderer OAuth (session.provider_token populated by supabase-js)
-     • external-browser OAuth (token stashed in state.pendingProviderToken
-       and looked up by the SIGNED_IN handler).
-   Persists to localStorage under pg-provider so a restored session on
-   the next launch can re-forward without making the user sign in again.
-   (Microsoft access tokens live ~1h; if the stored one is expired the
-   Graph call will 401 and we'd need a re-auth — future improvement is
-   refreshing via provider_refresh_token.)
+   user's behalf. Tokens are never persisted in renderer storage; they are
+   held only in memory long enough to hand them to Flask SessionState.
    Reloads /api/emails after the handoff so the renderer picks up the
    real Outlook inbox. */
 async function forwardProviderInfoToFlask(info, user) {
     if (!info || !info.provider_token) return;
     try {
-        try {
-            localStorage.setItem('pg-provider', JSON.stringify({
-                provider_token: info.provider_token,
-                provider_refresh_token: info.provider_refresh_token || '',
-                expires_in: info.expires_in || 3600,
-                saved_at: Date.now(),
-            }));
-        } catch (e) { /* quota or disabled localStorage — ignore */ }
         const meta = (user && user.user_metadata) || {};
         const name = meta.full_name || meta.name || (user && user.email) || '';
         await apiFetch('/api/auth/supabase-provider', {
@@ -3563,21 +3313,5 @@ async function forwardProviderInfoToFlask(info, user) {
         await loadEmails();
     } catch (e) {
         console.warn('[PhishGuard] could not forward provider token:', e);
-    }
-}
-
-/* Read a previously persisted provider token from localStorage. Used on
-   boot when supabase-js restores a session but session.provider_token is
-   null (because the session was created via setSession, which doesn't
-   carry provider tokens). Returns null if nothing stored. */
-function readStoredProviderInfo() {
-    try {
-        const raw = localStorage.getItem('pg-provider');
-        if (!raw) return null;
-        const parsed = JSON.parse(raw);
-        if (!parsed || !parsed.provider_token) return null;
-        return parsed;
-    } catch (e) {
-        return null;
     }
 }
