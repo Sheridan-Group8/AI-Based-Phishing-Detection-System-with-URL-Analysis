@@ -19,7 +19,7 @@ from functools import wraps
 from html.parser import HTMLParser
 from pathlib import Path
 import tempfile as _tempfile
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urlparse, urlsplit, unquote
 
 from flask import Flask, Response, jsonify, redirect, request, send_from_directory, session
 
@@ -328,6 +328,246 @@ def require_csrf(view):
     return wrapped
 
 
+_sender_profiles = {}
+_sender_profiles_lock = threading.Lock()
+
+
+def _persist_sender_profile_to_supabase(sender_email, profile, jwt):
+    """Upsert one sender DNA profile into Supabase for the signed-in user."""
+    if not jwt or not profile:
+        return
+    user_id = _jwt_user_id(jwt)
+    if not user_id:
+        return
+    body = {
+        "user_id": user_id,
+        "sender_email": sender_email,
+        "profile": profile,
+        "email_count": int(profile.get("email_count", 0) or 0),
+    }
+    resp = _supabase_request(
+        "POST", "sender_profiles", jwt,
+        json_body=body,
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
+    if resp is not None and resp.status_code >= 400:
+        print(f"WARNING: sender_profiles upsert failed [{resp.status_code}]: {resp.text[:200]}")
+
+
+def _analyze_writing_style(text):
+    """Extract writing-style features from email text."""
+    if not text or not text.strip():
+        return None
+
+    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
+    words = text.split()
+    word_count = len(words)
+    if word_count == 0:
+        return None
+
+    avg_sentence_len = len(words) / max(len(sentences), 1)
+    avg_word_len = sum(len(word) for word in words) / word_count
+    caps_ratio = sum(1 for ch in text if ch.isupper()) / max(len(text), 1)
+    exclamation_count = text.count("!")
+    question_count = text.count("?")
+    comma_density = text.count(",") / max(word_count, 1)
+
+    formal_words = {
+        "regarding", "furthermore", "consequently", "therefore", "hereby",
+        "pursuant", "accordingly", "sincerely", "respectfully", "cordially",
+        "attached", "enclosed",
+    }
+    informal_words = {
+        "hey", "hi", "lol", "btw", "fyi", "gonna", "wanna", "yeah",
+        "yep", "nope", "cool", "awesome", "thanks",
+    }
+    lower_words = {word.lower() for word in words}
+    formality = (len(lower_words & formal_words) - len(lower_words & informal_words)) / max(word_count, 1)
+
+    first_line = text.strip().split("\n")[0].lower().strip()
+    if any(first_line.startswith(g) for g in ("dear", "good morning", "good afternoon", "good evening")):
+        greeting = "formal"
+    elif any(first_line.startswith(g) for g in ("hi", "hey", "hello")):
+        greeting = "casual"
+    else:
+        greeting = "none"
+
+    has_signature = (
+        bool(re.search(r"(?:regards|best|sincerely|thanks|cheers|sent from)", text[-200:].lower()))
+        if len(text) > 50 else False
+    )
+
+    return {
+        "word_count": word_count,
+        "avg_sentence_len": round(avg_sentence_len, 2),
+        "avg_word_len": round(avg_word_len, 2),
+        "caps_ratio": round(caps_ratio, 4),
+        "exclamation_count": exclamation_count,
+        "question_count": question_count,
+        "comma_density": round(comma_density, 4),
+        "formality": round(formality, 4),
+        "greeting": greeting,
+        "has_signature": has_signature,
+    }
+
+
+def _extract_send_hour(datetime_str):
+    try:
+        dt = datetime.fromisoformat(str(datetime_str).replace("Z", "+00:00"))
+        return dt.hour
+    except Exception:
+        return None
+
+
+def _sender_addr_from_email(email):
+    sender = email.get("from", {})
+    if isinstance(sender, dict) and "emailAddress" in sender:
+        return (sender.get("emailAddress") or {}).get("address", "") or ""
+    if isinstance(sender, dict):
+        return sender.get("address", "") or sender.get("email", "") or ""
+    if isinstance(email.get("sender"), str):
+        return email.get("sender", "")
+    return ""
+
+
+def _build_sender_profile(sender_addr, emails):
+    """Build a behavioral profile from all messages by this sender."""
+    sender_addr = (sender_addr or "").lower().strip()
+    sender_emails = [
+        email for email in emails
+        if _sender_addr_from_email(email).lower() == sender_addr
+    ]
+    if not sender_emails:
+        return None
+
+    styles, send_hours = [], []
+    for email in sender_emails:
+        body = email.get("body", {})
+        content = body.get("content", "") if isinstance(body, dict) else str(body or "")
+        clean = _html_to_text(content) if "<" in content else re.sub(r"<[^>]+>", " ", content)
+        style = _analyze_writing_style(clean)
+        if style:
+            styles.append(style)
+        hour = _extract_send_hour(email.get("receivedDateTime", ""))
+        if hour is not None:
+            send_hours.append(hour)
+
+    if not styles:
+        return None
+
+    return {
+        "email": sender_addr,
+        "email_count": len(sender_emails),
+        "last_updated": datetime.now().isoformat(),
+        "avg_word_count": round(sum(s["word_count"] for s in styles) / len(styles), 1),
+        "avg_sentence_len": round(sum(s["avg_sentence_len"] for s in styles) / len(styles), 2),
+        "avg_word_len": round(sum(s["avg_word_len"] for s in styles) / len(styles), 2),
+        "avg_caps_ratio": round(sum(s["caps_ratio"] for s in styles) / len(styles), 4),
+        "avg_formality": round(sum(s["formality"] for s in styles) / len(styles), 4),
+        "typical_greeting": max(
+            {s["greeting"] for s in styles},
+            key=lambda g: sum(1 for s in styles if s["greeting"] == g),
+        ),
+        "usually_has_signature": sum(1 for s in styles if s["has_signature"]) > len(styles) / 2,
+        "typical_send_hours": sorted(set(send_hours)) if send_hours else [],
+        "avg_exclamations": round(sum(s["exclamation_count"] for s in styles) / len(styles), 1),
+    }
+
+
+def _compare_to_profile(profile, email):
+    """Compare a message against an established sender DNA profile."""
+    body = email.get("body", {})
+    content = body.get("content", "") if isinstance(body, dict) else str(body or "")
+    clean = _html_to_text(content) if "<" in content else re.sub(r"<[^>]+>", " ", content)
+    style = _analyze_writing_style(clean)
+    if not style or not profile:
+        return {"score": 0, "flags": [], "status": "insufficient_data"}
+
+    flags, deviation = [], 0
+    avg_word_count = profile["avg_word_count"]
+    if avg_word_count > 0:
+        ratio = style["word_count"] / avg_word_count
+        if ratio < 0.3 or ratio > 3.0:
+            flags.append({
+                "type": "length",
+                "message": f"Email length is unusual ({style['word_count']} words vs typical {int(avg_word_count)})",
+                "severity": "medium",
+            })
+            deviation += 20
+
+    if abs(style["avg_sentence_len"] - profile["avg_sentence_len"]) > 8:
+        flags.append({
+            "type": "sentence_style",
+            "message": "Writing style differs from this sender's usual pattern",
+            "severity": "medium",
+        })
+        deviation += 15
+
+    if style["caps_ratio"] - profile["avg_caps_ratio"] > 0.05:
+        flags.append({
+            "type": "caps",
+            "message": "Unusually high use of capital letters",
+            "severity": "low",
+        })
+        deviation += 10
+
+    formality_diff = abs(style["formality"] - profile["avg_formality"])
+    if formality_diff > 0.01:
+        flags.append({
+            "type": "formality",
+            "message": "Tone is more "
+            + ("formal" if style["formality"] > profile["avg_formality"] else "casual")
+            + " than usual",
+            "severity": "low",
+        })
+        deviation += 10
+
+    if style["greeting"] != profile["typical_greeting"] and profile["typical_greeting"] != "none":
+        flags.append({
+            "type": "greeting",
+            "message": f"Greeting style changed (usually '{profile['typical_greeting']}', now '{style['greeting']}')",
+            "severity": "low",
+        })
+        deviation += 10
+
+    if profile["usually_has_signature"] and not style["has_signature"]:
+        flags.append({
+            "type": "signature",
+            "message": "Email signature is missing (this sender usually includes one)",
+            "severity": "medium",
+        })
+        deviation += 15
+
+    hour = _extract_send_hour(email.get("receivedDateTime", ""))
+    if hour is not None and profile["typical_send_hours"]:
+        min_dist = min(abs(hour - h) for h in profile["typical_send_hours"])
+        min_dist = min(min_dist, 24 - min_dist)
+        if min_dist > 6:
+            flags.append({
+                "type": "send_time",
+                "message": f"Sent at an unusual time ({hour}:00 - typically active around {profile['typical_send_hours'][0]}:00)",
+                "severity": "low",
+            })
+            deviation += 10
+
+    if style["exclamation_count"] > profile["avg_exclamations"] + 3:
+        flags.append({
+            "type": "urgency",
+            "message": "More exclamation marks than usual (possible urgency manipulation)",
+            "severity": "medium",
+        })
+        deviation += 15
+
+    deviation = min(100, deviation)
+    status = "suspicious" if deviation >= 50 else "minor_deviation" if deviation >= 25 else "matches"
+    return {
+        "score": deviation,
+        "flags": flags,
+        "status": status,
+        "profile_emails": profile["email_count"],
+    }
+
+
 LOG_FILE = USER_DATA_DIR / "phishguard_log.txt"
 
 
@@ -435,25 +675,21 @@ VT_API_BASE = "https://www.virustotal.com/api/v3"
 VT_CACHE_TTL_SECONDS = 24 * 3600
 _vt_cache_lock = threading.Lock()
 _vt_cache = {}
+VT_URL_MAX_PER_EMAIL = 10
+VT_URL_SUBMIT_MAX_PER_EMAIL = 3
+VT_URL_SUBMIT_WAIT = 45
+VT_URL_SUBMIT_POLL = 6
+_vt_url_cache_lock = threading.Lock()
+_vt_url_cache = {}
 
 URLSCAN_API_KEY = os.environ.get("URLSCAN_API_KEY", "").strip()
 URLSCAN_CACHE_TTL_SECONDS = 12 * 3600
 _urlscan_cache_lock = threading.Lock()
 _urlscan_cache = {}
-
-PHISHTANK_API_KEY = os.environ.get("PHISHTANK_API_KEY", "").strip()
-PHISHTANK_FEED_URL_AUTH = "http://data.phishtank.com/data/{key}/online-valid.json"
-PHISHTANK_FEED_URL_NOAUTH = "http://data.phishtank.com/data/online-valid.json"
-URLHAUS_FEED_URL = "https://urlhaus.abuse.ch/downloads/json_online/"
-PHISHTANK_REFRESH_INTERVAL = 6 * 3600
-PHISHTANK_DOWNLOAD_TIMEOUT = (10, 120)
-_phishtank_lock = threading.Lock()
-_phishtank_data = {
-    "domains": set(),
-    "urls": set(),
-    "updated_at": None,
-    "count": 0,
-}
+URLSCAN_VISIBILITY = "unlisted"
+URLSCAN_LIVE_MAX_PER_EMAIL = 3
+URLSCAN_LIVE_WAIT_SECONDS = 45
+URLSCAN_LIVE_POLL_INTERVAL = 6
 
 _runtime_dir = USER_DATA_DIR
 _COMMUNITY_DB_PATH = _runtime_dir / "local_scan_history.json"
@@ -610,23 +846,134 @@ def _vt_poll_analysis(analysis_id):
     }
 
 
+def _check_virustotal_url(url):
+    """Look up exact URL reputation on VirusTotal v3."""
+    if not VIRUSTOTAL_API_KEY or not http_requests or not url:
+        return None
+    with _vt_url_cache_lock:
+        cached = _vt_url_cache.get(url)
+        if cached and (datetime.now() - cached["cached_at"]).total_seconds() < VT_CACHE_TTL_SECONDS:
+            return cached["result"]
+
+    url_id = base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii").strip("=")
+    try:
+        resp = http_requests.get(
+            f"{VT_API_BASE}/urls/{url_id}",
+            headers={
+                "x-apikey": VIRUSTOTAL_API_KEY,
+                "User-Agent": "PhishGuard/2.0 (+phishguard-capstone)",
+            },
+            timeout=HTTP_TIMEOUT,
+        )
+    except Exception as exc:
+        return {"error": f"network: {exc}", "status": 0}
+
+    if resp.status_code == 404:
+        result = {"found": False, "malicious": 0, "suspicious": 0, "total": 0}
+    elif resp.status_code == 200:
+        try:
+            attrs = resp.json().get("data", {}).get("attributes", {}) or {}
+            stats = attrs.get("last_analysis_stats", {}) or {}
+            result = {
+                "found": True,
+                "malicious": int(stats.get("malicious", 0) or 0),
+                "suspicious": int(stats.get("suspicious", 0) or 0),
+                "harmless": int(stats.get("harmless", 0) or 0),
+                "undetected": int(stats.get("undetected", 0) or 0),
+                "total": int(sum(v or 0 for v in stats.values())),
+            }
+        except Exception as exc:
+            return {"error": f"parse: {exc}", "status": 200}
+    elif resp.status_code in (401, 429):
+        return {
+            "error": "VT key invalid" if resp.status_code == 401 else "VT rate limit",
+            "status": resp.status_code,
+        }
+    else:
+        return {"error": f"http {resp.status_code}", "status": resp.status_code}
+
+    with _vt_url_cache_lock:
+        _vt_url_cache[url] = {"result": result, "cached_at": datetime.now()}
+    return result
+
+
+def _vt_submit_url(url):
+    """Submit a URL to VirusTotal for a fresh scan."""
+    if not VIRUSTOTAL_API_KEY or not http_requests or not url:
+        return None
+    try:
+        resp = http_requests.post(
+            f"{VT_API_BASE}/urls",
+            headers={
+                "x-apikey": VIRUSTOTAL_API_KEY,
+                "User-Agent": "PhishGuard/2.0 (+phishguard-capstone)",
+            },
+            data={"url": url},
+            timeout=(5, 30),
+        )
+    except Exception as exc:
+        return {"error": f"network: {exc}", "status": 0}
+    if resp.status_code in (401, 429):
+        return {
+            "error": "VT key invalid" if resp.status_code == 401 else "VT rate limit",
+            "status": resp.status_code,
+        }
+    if resp.status_code not in (200, 201):
+        return {"error": f"http {resp.status_code}", "status": resp.status_code}
+    try:
+        analysis_id = resp.json().get("data", {}).get("id", "")
+    except Exception as exc:
+        return {"error": f"parse: {exc}", "status": 200}
+    return {"analysis_id": analysis_id} if analysis_id else {"error": "no analysis id", "status": 200}
+
+
+def _vt_scan_url(url):
+    """Submit a URL to VirusTotal and wait briefly for a completed verdict."""
+    submitted = _vt_submit_url(url)
+    if not isinstance(submitted, dict) or "analysis_id" not in submitted:
+        return submitted if isinstance(submitted, dict) else None
+
+    analysis_id = submitted["analysis_id"]
+    waited = 0
+    while waited < VT_URL_SUBMIT_WAIT:
+        _time.sleep(VT_URL_SUBMIT_POLL)
+        waited += VT_URL_SUBMIT_POLL
+        result = _vt_poll_analysis(analysis_id)
+        if result is None:
+            return None
+        if "error" in result:
+            return result
+        if result.get("status") != "completed":
+            continue
+        normalized = {
+            "found": True,
+            "malicious": int(result.get("malicious", 0) or 0),
+            "suspicious": int(result.get("suspicious", 0) or 0),
+            "harmless": int(result.get("harmless", 0) or 0),
+            "undetected": int(result.get("undetected", 0) or 0),
+            "total": int(result.get("total", 0) or 0),
+        }
+        with _vt_url_cache_lock:
+            _vt_url_cache[url] = {"result": normalized, "cached_at": datetime.now()}
+        return normalized
+    return {"pending": True, "timeout": True}
+
+
 def _check_urlscan(domain):
     """Query urlscan.io public search for prior scans of a domain."""
     if not URLSCAN_API_KEY or not http_requests or not domain:
         return None
     key = domain.lower().strip()
-
     with _urlscan_cache_lock:
         entry = _urlscan_cache.get(key)
         if entry:
             age = (datetime.now() - entry["cached_at"]).total_seconds()
             if age < URLSCAN_CACHE_TTL_SECONDS:
                 return entry["result"]
-
     try:
         resp = http_requests.get(
             "https://urlscan.io/api/v1/search/",
-            params={"q": f"domain:{key}", "size": 5},
+            params={"q": f"domain:{key}", "size": 20},
             headers={
                 "API-Key": URLSCAN_API_KEY,
                 "User-Agent": "PhishGuard/2.0 (+phishguard-capstone)",
@@ -650,20 +997,40 @@ def _check_urlscan(domain):
 
     items = data.get("results", []) or []
     if not items:
-        result = {"found": False, "scan_count": 0, "malicious": False}
+        result = {"found": False, "scan_count": 0, "malicious": False,
+                  "verdict": "unknown"}
     else:
-        malicious = False
-        for item in items[:5]:
-            verdicts = item.get("verdicts", {}) or {}
-            overall = verdicts.get("overall", {}) or {}
+        malicious_count = 0
+        max_score = 0
+        brands, categories = set(), set()
+        for item in items:
+            overall = ((item.get("verdicts") or {}).get("overall") or {})
             if overall.get("malicious"):
-                malicious = True
-                break
+                malicious_count += 1
+            try:
+                max_score = max(max_score, int(overall.get("score") or 0))
+            except (TypeError, ValueError):
+                pass
+            for brand in (overall.get("brands") or []):
+                brands.add(brand.get("name") if isinstance(brand, dict) else str(brand))
+            for category in (overall.get("categories") or []):
+                categories.add(str(category))
+        if malicious_count > 0 or max_score >= 60:
+            verdict = "malicious"
+        elif max_score >= 30 or brands:
+            verdict = "suspicious"
+        else:
+            verdict = "clean"
         latest = items[0]
         result = {
             "found": True,
             "scan_count": len(items),
-            "malicious": malicious,
+            "malicious": verdict == "malicious",
+            "verdict": verdict,
+            "malicious_scans": malicious_count,
+            "max_score": max_score,
+            "brands": sorted(brands)[:5],
+            "categories": sorted(categories)[:5],
             "latest_result": latest.get("result", ""),
             "latest_screenshot": latest.get("screenshot", ""),
         }
@@ -673,149 +1040,108 @@ def _check_urlscan(domain):
     return result
 
 
-def _phishtank_domain_key(host):
-    """Normalize a host for local threat-feed comparison."""
-    if not host:
-        return ""
-    host = host.lower().strip()
-    host = host.split("@")[-1].split(":")[0]
-    if host.startswith("www."):
-        host = host[4:]
-    return host
-
-
-def _download_phishtank_entries():
-    """Download PhishTank feed entries when available."""
-    if not http_requests:
-        return []
-    url = (PHISHTANK_FEED_URL_AUTH.format(key=PHISHTANK_API_KEY)
-           if PHISHTANK_API_KEY else PHISHTANK_FEED_URL_NOAUTH)
-    label = "PhishTank-authed" if PHISHTANK_API_KEY else "PhishTank-anon"
+def _urlscan_submit(url):
+    """Submit a URL to urlscan.io for a bounded live scan."""
+    if not URLSCAN_API_KEY or not http_requests or not url:
+        return None
     try:
-        print(f"[{label}] downloading feed...")
-        resp = http_requests.get(
-            url,
-            headers={"User-Agent": "PhishGuard/2.0 (+phishguard-capstone)"},
-            timeout=PHISHTANK_DOWNLOAD_TIMEOUT,
+        resp = http_requests.post(
+            "https://urlscan.io/api/v1/scan/",
+            headers={
+                "API-Key": URLSCAN_API_KEY,
+                "Content-Type": "application/json",
+                "User-Agent": "PhishGuard/2.0 (+phishguard-capstone)",
+            },
+            json={"url": url, "visibility": URLSCAN_VISIBILITY},
+            timeout=HTTP_TIMEOUT,
         )
     except Exception as exc:
-        print(f"[{label}] feed download failed: {exc}")
-        return []
-
-    if resp.status_code != 200:
-        print(f"[{label}] feed returned HTTP {resp.status_code}")
-        return []
+        return {"error": f"network: {exc}", "status": 0}
+    if resp.status_code in (400, 401, 429):
+        return {
+            "error": {
+                400: "urlscan rejected the URL",
+                401: "urlscan key invalid",
+                429: "urlscan submission rate limited",
+            }[resp.status_code],
+            "status": resp.status_code,
+        }
+    if resp.status_code not in (200, 201):
+        return {"error": f"http {resp.status_code}", "status": resp.status_code}
     try:
-        data = resp.json()
-    except ValueError as exc:
-        print(f"[{label}] feed not JSON: {exc}")
-        return []
-    return data if isinstance(data, list) else []
+        uuid = resp.json().get("uuid", "")
+    except Exception as exc:
+        return {"error": f"parse: {exc}", "status": 200}
+    return {"uuid": uuid} if uuid else {"error": "no uuid returned", "status": 200}
 
 
-def _download_urlhaus_entries():
-    """Download URLhaus online URL feed. No API key required."""
-    if not http_requests:
-        return []
+def _urlscan_result(uuid):
+    """Fetch a urlscan result by uuid and normalize it to the search verdict shape."""
+    if not URLSCAN_API_KEY or not http_requests or not uuid:
+        return None
     try:
-        print("[URLhaus] downloading feed...")
         resp = http_requests.get(
-            URLHAUS_FEED_URL,
-            headers={"User-Agent": "PhishGuard/2.0 (+phishguard-capstone)"},
-            timeout=PHISHTANK_DOWNLOAD_TIMEOUT,
+            f"https://urlscan.io/api/v1/result/{uuid}/",
+            headers={
+                "API-Key": URLSCAN_API_KEY,
+                "User-Agent": "PhishGuard/2.0 (+phishguard-capstone)",
+            },
+            timeout=HTTP_TIMEOUT,
         )
     except Exception as exc:
-        print(f"[URLhaus] feed download failed: {exc}")
-        return []
-
+        return {"error": f"network: {exc}", "status": 0}
+    if resp.status_code == 404:
+        return {"pending": True}
     if resp.status_code != 200:
-        print(f"[URLhaus] feed returned HTTP {resp.status_code}")
-        return []
+        return {"error": f"http {resp.status_code}", "status": resp.status_code}
     try:
-        raw = resp.json()
-    except ValueError as exc:
-        print(f"[URLhaus] feed not JSON: {exc}")
-        return []
-
-    out = []
-    if isinstance(raw, dict):
-        for rec in raw.values():
-            if isinstance(rec, list) and rec:
-                out.append(rec[0])
-            elif isinstance(rec, dict):
-                out.append(rec)
-    elif isinstance(raw, list):
-        out = raw
-    return out
-
-
-def _load_phishtank_feed():
-    """Load PhishTank and URLhaus feeds into an in-memory lookup table."""
-    combined_entries = []
-    combined_entries.extend(_download_phishtank_entries())
-    combined_entries.extend(_download_urlhaus_entries())
-    if not combined_entries:
-        print("[PhishTank/URLhaus] no entries loaded")
-        return
-
-    domains = set()
-    urls = set()
-    for entry in combined_entries:
-        if not isinstance(entry, dict):
-            continue
-        phish_url = entry.get("url", "")
-        if not phish_url:
-            continue
-        url_l = phish_url.lower().strip()
-        urls.add(url_l)
-        try:
-            host = _phishtank_domain_key(urlparse(url_l).netloc)
-            if host:
-                domains.add(host)
-        except Exception:
-            pass
-
-    with _phishtank_lock:
-        _phishtank_data["domains"] = domains
-        _phishtank_data["urls"] = urls
-        _phishtank_data["updated_at"] = datetime.now()
-        _phishtank_data["count"] = len(combined_entries)
-    print(f"[Threat feed] active: {len(combined_entries)} entries, "
-          f"{len(domains)} domains, {len(urls)} urls")
+        overall = ((resp.json().get("verdicts") or {}).get("overall") or {})
+        score = int(overall.get("score") or 0)
+        malicious = bool(overall.get("malicious"))
+        brands = sorted({
+            brand.get("name") if isinstance(brand, dict) else str(brand)
+            for brand in (overall.get("brands") or [])
+        })
+        categories = sorted({str(cat) for cat in (overall.get("categories") or [])})
+    except Exception as exc:
+        return {"error": f"parse: {exc}", "status": 200}
+    verdict = ("malicious" if (malicious or score >= 60)
+               else "suspicious" if (score >= 30 or brands) else "clean")
+    return {
+        "found": True,
+        "live": True,
+        "verdict": verdict,
+        "malicious": verdict == "malicious",
+        "scan_count": 1,
+        "max_score": score,
+        "brands": brands[:5],
+        "categories": categories[:5],
+    }
 
 
-def _start_phishtank_refresher():
-    """Start a background refresh loop for local threat feeds."""
-    def _loop():
-        while True:
-            try:
-                _load_phishtank_feed()
-            except Exception as exc:
-                print(f"[PhishTank] refresh error: {exc}")
-            _time.sleep(PHISHTANK_REFRESH_INTERVAL)
+def _urlscan_live_scan(url, host=""):
+    """Submit a host URL to urlscan and wait briefly for a domain-level verdict."""
+    submitted = _urlscan_submit(url)
+    if not isinstance(submitted, dict) or "uuid" not in submitted:
+        return submitted if isinstance(submitted, dict) else None
 
-    thread = threading.Thread(target=_loop, name="phishtank-refresher", daemon=True)
-    thread.start()
-
-
-def _check_phishtank(domain):
-    """Check a domain locally against the loaded PhishTank/URLhaus feed."""
-    if not domain:
-        return None
-    with _phishtank_lock:
-        if not _phishtank_data["updated_at"]:
+    uuid = submitted["uuid"]
+    waited = 0
+    while waited < URLSCAN_LIVE_WAIT_SECONDS:
+        _time.sleep(URLSCAN_LIVE_POLL_INTERVAL)
+        waited += URLSCAN_LIVE_POLL_INTERVAL
+        result = _urlscan_result(uuid)
+        if result is None:
             return None
-        return _phishtank_domain_key(domain) in _phishtank_data["domains"]
-
-
-def _check_phishtank_url(url):
-    """Check a specific URL locally against the loaded threat feed."""
-    if not url:
-        return None
-    with _phishtank_lock:
-        if not _phishtank_data["updated_at"]:
-            return None
-        return url.lower().strip() in _phishtank_data["urls"]
+        if "error" in result:
+            return result
+        if result.get("pending"):
+            continue
+        if host:
+            with _urlscan_cache_lock:
+                _urlscan_cache[host] = {"result": result, "cached_at": datetime.now()}
+        return result
+    return {"pending": True, "timeout": True}
 
 
 def _check_urlhaus(url_or_domain):
@@ -834,6 +1160,315 @@ def _check_urlhaus(url_or_domain):
                 return False
             urls_online = data.get("urls", [])
             return any(u.get("url_status") == "online" for u in urls_online)
+    except Exception:
+        pass
+    return None
+
+
+GSB_API_KEY = os.environ.get("GOOGLE_SAFE_BROWSING_KEY", "").strip()
+GSB_CACHE_TTL_SECONDS = 6 * 3600
+GSB_MAX_URLS = 500
+GSB_MAX_PREFIXES = 1000
+_gsb_cache_lock = threading.Lock()
+_gsb_cache = {}
+_GSB_IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+_GSB_THREAT_TYPES = {
+    1: "MALWARE",
+    2: "SOCIAL_ENGINEERING",
+    3: "UNWANTED_SOFTWARE",
+    4: "POTENTIALLY_HARMFUL_APPLICATION",
+}
+
+
+def _gsb_canonicalize(url):
+    """Canonicalize a URL for Google Safe Browsing hash expressions."""
+    if not url:
+        return ""
+    text = url.strip().replace("\t", "").replace("\r", "").replace("\n", "")
+    text = text.split("#", 1)[0]
+    if "://" not in text:
+        text = "http://" + text
+    parts = urlsplit(text)
+    host, path, query = (parts.hostname or ""), (parts.path or "/"), parts.query
+
+    def unquote_all(value):
+        previous = None
+        while previous != value:
+            previous, value = value, unquote(value)
+        return value
+
+    host, path = unquote_all(host), unquote_all(path)
+    host = re.sub(r"\.{2,}", ".", host.strip(".")).lower()
+    if not path.startswith("/"):
+        path = "/" + path
+    trailing = path.endswith("/")
+    segments = []
+    for segment in path.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if segments:
+                segments.pop()
+        else:
+            segments.append(segment)
+    path = "/" + "/".join(segments) + ("/" if trailing and segments else "")
+    if not path:
+        path = "/"
+
+    def escape(value):
+        out = []
+        for ch in value:
+            code = ord(ch)
+            if code <= 0x20 or code >= 0x7F or ch in ("#", "%"):
+                out.append("".join(f"%{b:02X}" for b in ch.encode("utf-8")))
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    canonical = escape(host) + escape(path)
+    if query:
+        canonical += "?" + escape(query)
+    return canonical
+
+
+def _gsb_expressions(url):
+    """Return Safe Browsing host-suffix/path-prefix expressions for a URL."""
+    canonical = _gsb_canonicalize(url)
+    if not canonical:
+        return []
+    slash = canonical.find("/")
+    host, pathq = (canonical, "/") if slash == -1 else (canonical[:slash], canonical[slash:])
+    qpos = pathq.find("?")
+    path, query = (pathq, "") if qpos == -1 else (pathq[:qpos], pathq[qpos + 1:])
+    path = path or "/"
+
+    if _GSB_IP_RE.match(host):
+        hosts = [host]
+    else:
+        labels = host.split(".")
+        hosts = [host]
+        for i in range(max(0, len(labels) - 5), len(labels) - 1):
+            candidate = ".".join(labels[i:])
+            if candidate not in hosts and len(candidate.split(".")) >= 2:
+                hosts.append(candidate)
+        hosts = hosts[:5]
+
+    paths = []
+    if query:
+        paths.append(path + "?" + query)
+    paths.append(path)
+    paths.append("/")
+    acc, dirs = "", 0
+    segments = [seg for seg in path.split("/") if seg]
+    walk = segments if path.endswith("/") else segments[:-1]
+    for segment in walk:
+        acc += "/" + segment
+        if acc + "/" not in paths:
+            paths.append(acc + "/")
+            dirs += 1
+        if dirs >= 4:
+            break
+
+    seen_paths, deduped_paths = set(), []
+    for path_item in paths:
+        if path_item not in seen_paths:
+            seen_paths.add(path_item)
+            deduped_paths.append(path_item)
+    paths = deduped_paths[:6]
+
+    expressions, seen = [], set()
+    for host_item in hosts:
+        for path_item in paths:
+            expr = host_item + path_item
+            if expr not in seen:
+                seen.add(expr)
+                expressions.append(expr)
+    return expressions[:30]
+
+
+def _gsb_varint(data, pos):
+    result = shift = 0
+    while True:
+        byte = data[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, pos
+        shift += 7
+
+
+def _gsb_parse_response(body):
+    """Parse the small protobuf response shape returned by hashes:search."""
+    results, pos, end = [], 0, len(body)
+    try:
+        while pos < end:
+            tag, pos = _gsb_varint(body, pos)
+            field, wire = tag >> 3, tag & 7
+            if field == 1 and wire == 2:
+                length, pos = _gsb_varint(body, pos)
+                sub, pos = body[pos:pos + length], pos + length
+                full_hash, threat, q = None, 0, 0
+                while q < len(sub):
+                    tag2, q = _gsb_varint(sub, q)
+                    field2, wire2 = tag2 >> 3, tag2 & 7
+                    if field2 == 1 and wire2 == 2:
+                        length2, q = _gsb_varint(sub, q)
+                        full_hash, q = sub[q:q + length2], q + length2
+                    elif field2 == 2 and wire2 == 2:
+                        length2, q = _gsb_varint(sub, q)
+                        detail, q = sub[q:q + length2], q + length2
+                        dpos = 0
+                        while dpos < len(detail):
+                            tag3, dpos = _gsb_varint(detail, dpos)
+                            field3, wire3 = tag3 >> 3, tag3 & 7
+                            if field3 == 1 and wire3 == 0:
+                                threat, dpos = _gsb_varint(detail, dpos)
+                            elif wire3 == 2:
+                                length3, dpos = _gsb_varint(detail, dpos)
+                                dpos += length3
+                            elif wire3 == 0:
+                                _, dpos = _gsb_varint(detail, dpos)
+                            else:
+                                break
+                    elif wire2 == 2:
+                        length2, q = _gsb_varint(sub, q)
+                        q += length2
+                    elif wire2 == 0:
+                        _, q = _gsb_varint(sub, q)
+                    else:
+                        break
+                if full_hash is not None:
+                    results.append((full_hash, threat))
+            elif wire == 2:
+                length, pos = _gsb_varint(body, pos)
+                pos += length
+            elif wire == 0:
+                _, pos = _gsb_varint(body, pos)
+            elif wire == 5:
+                pos += 4
+            elif wire == 1:
+                pos += 8
+            else:
+                break
+    except Exception:
+        pass
+    return results
+
+
+def _check_safe_browsing(urls):
+    """Google Safe Browsing v5 hash-prefix lookup for a batch of URLs."""
+    if not GSB_API_KEY or not http_requests or not urls:
+        return {}
+    now = datetime.now()
+    to_query, cached_hits, seen = [], {}, set()
+    with _gsb_cache_lock:
+        for url in urls:
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            cached = _gsb_cache.get(url)
+            if cached and (now - cached["cached_at"]).total_seconds() < GSB_CACHE_TTL_SECONDS:
+                if cached["threat"]:
+                    cached_hits[url] = cached["threat"]
+            else:
+                to_query.append(url)
+    to_query = to_query[:GSB_MAX_URLS]
+    if not to_query:
+        return cached_hits
+
+    full_to_urls, prefixes = {}, set()
+    for url in to_query:
+        for expr in _gsb_expressions(url):
+            digest = hashlib.sha256(expr.encode("utf-8")).digest()
+            full_to_urls.setdefault(digest, set()).add(url)
+            prefixes.add(digest[:4])
+            if len(prefixes) >= GSB_MAX_PREFIXES:
+                break
+    if not prefixes:
+        return cached_hits
+
+    prefixes_b64 = [
+        base64.b64encode(prefix).decode("ascii")
+        for prefix in list(prefixes)[:GSB_MAX_PREFIXES]
+    ]
+    try:
+        resp = http_requests.get(
+            "https://safebrowsing.googleapis.com/v5/hashes:search",
+            params={"key": GSB_API_KEY, "hashPrefixes": prefixes_b64},
+            timeout=HTTP_TIMEOUT,
+        )
+        body = resp.content if resp.status_code == 200 else b""
+    except Exception:
+        return cached_hits
+
+    matched = {}
+    for full_hash, threat_int in _gsb_parse_response(body):
+        owners = full_to_urls.get(full_hash)
+        if not owners:
+            continue
+        threat = _GSB_THREAT_TYPES.get(threat_int, "THREAT")
+        for owner in owners:
+            matched[owner] = threat
+
+    with _gsb_cache_lock:
+        for url in to_query:
+            _gsb_cache[url] = {"threat": matched.get(url), "cached_at": now}
+    hits = dict(cached_hits)
+    hits.update(matched)
+    return hits
+
+
+_IPV4_RE = re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})")
+
+
+def _extract_sender_ip(headers):
+    """Return a public originating sender IP from message headers."""
+    import ipaddress
+
+    header_map = _hdr_dict(headers)
+    if not header_map:
+        return None
+
+    def is_public(ip):
+        try:
+            addr = ipaddress.ip_address(ip)
+            return not (
+                addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast
+            )
+        except ValueError:
+            return False
+
+    for source in (
+        header_map.get("x-sender-ip"),
+        header_map.get("x-ms-exchange-crosstenant-originalattributedtenantconnectingip"),
+        header_map.get("x-originating-ip"),
+        header_map.get("received"),
+    ):
+        if not source:
+            continue
+        for candidate in _IPV4_RE.findall(source):
+            if is_public(candidate):
+                return candidate
+    return None
+
+
+def _check_abuseipdb_ip(ip):
+    """AbuseIPDB reputation for the originating mail-sender IP."""
+    api_key = os.environ.get("ABUSEIPDB_KEY", "").strip()
+    if not api_key or not http_requests or not ip:
+        return None
+    try:
+        resp = http_requests.get(
+            "https://api.abuseipdb.com/api/v2/check",
+            params={"ipAddress": ip, "maxAgeInDays": 90},
+            headers={"Key": api_key, "Accept": "application/json"},
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            data = resp.json().get("data", {})
+            score = data.get("abuseConfidenceScore", 0)
+            return {"ip": ip, "score": score, "is_abusive": score > 50}
     except Exception:
         pass
     return None
@@ -962,14 +1597,6 @@ def _check_domain_reputation(domain):
     elif dns_exists is True and not is_trusted:
         signals.append(("dns_ok", "Domain resolves in DNS"))
 
-    # 6. PhishTank database check
-    phishtank_hit = _check_phishtank(domain)
-    if phishtank_hit is True:
-        score -= 0.5
-        signals.append(("phishtank", "Listed in PhishTank as a known phishing site"))
-    elif phishtank_hit is False:
-        signals.append(("phishtank_clean", "Not found in PhishTank database"))
-
     # Clamp
     score = max(0.0, min(1.0, score))
 
@@ -1062,71 +1689,168 @@ def run_threat_intel(email, urls_in_email=None):
         "domain": domain,
         "checks": {},
         "confirmed_phishing": False,
-        "confidence_boost": 0.0,
         "signals": [],
         "url_threats": {},
     }
 
-    seen_hosts = set()
-    for raw_url in (urls_in_email or [])[:_MAX_URLS_PER_EMAIL]:
-        url = (raw_url or "").strip()
-        if not url:
-            continue
-        try:
-            host = (urlparse(url).hostname or "").lower()
-        except Exception:
-            host = ""
+    if urls_in_email:
+        gsb_hits = _check_safe_browsing(urls_in_email)
+        seen_hosts = set()
+        urlhaus_calls = 0
+        urlscan_live_submits = 0
+        urlscan_rate_limited = False
+        vt_url_calls = 0
+        vt_submits = 0
+        vt_rate_limited = False
 
-        pt_url = _check_phishtank_url(url)
-        if pt_url is True:
-            results["url_threats"][url] = {
-                "malicious": True,
-                "sources": ["PhishTank"],
-            }
-            results["confirmed_phishing"] = True
-            results["signals"].append(f"PhishTank: link is confirmed phishing ({url})")
+        for raw_url in urls_in_email[:_MAX_URLS_PER_EMAIL]:
+            url = (raw_url or "").strip()
+            if not url:
+                continue
+            try:
+                host = (urlparse(url).hostname or "").lower()
+            except Exception:
+                host = ""
 
-        if host and host not in seen_hosts:
-            seen_hosts.add(host)
-            sources = []
-            if _check_urlhaus(host) is True:
-                sources.append("URLhaus")
-            us_host = _check_urlscan(host)
-            if isinstance(us_host, dict):
-                if us_host.get("malicious"):
-                    sources.append("urlscan.io")
-                elif us_host.get("verdict") == "suspicious":
+            if url in gsb_hits and url not in results["url_threats"]:
+                threat_type = str(gsb_hits[url]).replace("_", " ").title()
+                results["url_threats"][url] = {
+                    "malicious": True,
+                    "sources": [f"Google Safe Browsing ({threat_type})"],
+                }
+                results["confirmed_phishing"] = True
+                results["signals"].append(
+                    f"Google Safe Browsing: a link is flagged as {threat_type} ({url})"
+                )
+
+            existing = results["url_threats"].get(url)
+            if (
+                vt_url_calls < VT_URL_MAX_PER_EMAIL
+                and not vt_rate_limited
+                and not (isinstance(existing, dict) and existing.get("malicious"))
+                and host
+                and _link_domain_untrusted(host)
+            ):
+                vt_url_calls += 1
+                vt_result = _check_virustotal_url(url)
+                if isinstance(vt_result, dict) and vt_result.get("status") == 429:
+                    vt_rate_limited = True
+                if (
+                    isinstance(vt_result, dict)
+                    and vt_result.get("found") is False
+                    and vt_submits < VT_URL_SUBMIT_MAX_PER_EMAIL
+                    and not vt_rate_limited
+                ):
+                    vt_submits += 1
+                    scanned = _vt_scan_url(url)
+                    if isinstance(scanned, dict) and scanned.get("found"):
+                        vt_result = scanned
+                    elif isinstance(scanned, dict) and scanned.get("status") == 429:
+                        vt_rate_limited = True
+                if isinstance(vt_result, dict) and vt_result.get("found") is not None:
+                    entry = results["url_threats"].get(url)
+                    entry = entry if isinstance(entry, dict) else {"malicious": False}
+                    if vt_result.get("found") and vt_result.get("malicious", 0) >= 1:
+                        entry["malicious"] = True
+                        entry.setdefault("sources", []).append("VirusTotal")
+                        entry["vt"] = "malicious"
+                        results["confirmed_phishing"] = True
+                        results["signals"].append(
+                            f"VirusTotal: {vt_result['malicious']} engines flag this link as malicious ({url})"
+                        )
+                    elif vt_result.get("found") and vt_result.get("suspicious", 0) >= 2:
+                        entry["vt"] = "suspicious"
+                    elif vt_result.get("found"):
+                        entry["vt"] = "clean"
+                    else:
+                        entry["vt"] = "unknown"
+                    results["url_threats"][url] = entry
+
+            if (
+                host
+                and host not in seen_hosts
+                and host not in results["url_threats"]
+                and urlhaus_calls < 10
+            ):
+                seen_hosts.add(host)
+                urlhaus_calls += 1
+                sources = []
+                suspicious_note = None
+                urlscan_clean = False
+                if _check_urlhaus(host) is True:
+                    sources.append("URLhaus")
+                us_host = _check_urlscan(host)
+                if isinstance(us_host, dict):
+                    if us_host.get("malicious"):
+                        sources.append("urlscan.io")
+                    elif us_host.get("verdict") == "suspicious":
+                        brand_note = (
+                            " impersonating " + ", ".join(us_host["brands"])
+                            if us_host.get("brands") else ""
+                        )
+                        suspicious_note = (
+                            "urlscan.io: prior scans of this link's host "
+                            f"scored it risky (score {us_host.get('max_score', 0)}{brand_note})"
+                        )
+                    elif us_host.get("verdict") == "clean":
+                        urlscan_clean = True
+                    elif us_host.get("found") is False:
+                        if (
+                            _link_domain_untrusted(host)
+                            and not sources
+                            and not urlscan_rate_limited
+                            and urlscan_live_submits < URLSCAN_LIVE_MAX_PER_EMAIL
+                        ):
+                            urlscan_live_submits += 1
+                            try:
+                                scheme = urlparse(url).scheme or "https"
+                            except Exception:
+                                scheme = "https"
+                            live = _urlscan_live_scan(f"{scheme}://{host}", host)
+                            if isinstance(live, dict):
+                                if live.get("status") == 429:
+                                    urlscan_rate_limited = True
+                                elif live.get("verdict") == "malicious":
+                                    sources.append("urlscan.io")
+                                elif live.get("verdict") == "suspicious":
+                                    brand_note = (
+                                        " impersonating " + ", ".join(live["brands"])
+                                        if live.get("brands") else ""
+                                    )
+                                    suspicious_note = (
+                                        "urlscan.io live scan scored this link risky "
+                                        f"(score {live.get('max_score', 0)}{brand_note})"
+                                    )
+                                elif live.get("verdict") == "clean":
+                                    urlscan_clean = True
+                                    results["signals"].append(
+                                        f"urlscan.io: live scan of {host} found no threats"
+                                    )
+
+                if sources:
+                    results["url_threats"][host] = {
+                        "malicious": True,
+                        "sources": sources,
+                    }
+                    results["confirmed_phishing"] = True
+                    results["signals"].append(
+                        f"{'/'.join(sources)}: a link host in this email is confirmed malicious ({host})"
+                    )
+                elif suspicious_note:
                     results["url_threats"][host] = {
                         "malicious": False,
                         "suspicious": True,
                         "sources": ["urlscan.io"],
                     }
-                    results["signals"].append(
-                        f"urlscan.io: prior scans scored this link host risky ({host})"
-                    )
-                elif us_host.get("verdict") == "clean":
+                    results["signals"].append(suspicious_note)
+                elif urlscan_clean:
                     results["url_threats"][host] = {
                         "malicious": False,
                         "urlscan_clean": True,
                     }
-            if sources:
-                results["url_threats"][host] = {
-                    "malicious": True,
-                    "sources": sources,
-                }
-                results["confirmed_phishing"] = True
-                results["signals"].append(
-                    f"{'/'.join(sources)}: link host is confirmed malicious ({host})"
-                )
 
     if not domain:
         return results
-
-    pt = _check_phishtank(domain)
-    results["checks"]["phishtank"] = pt
-    if pt is True:
-        results["confirmed_phishing"] = True
-        results["signals"].append("PhishTank: Domain is a confirmed phishing site")
 
     uh = _check_urlhaus(domain)
     results["checks"]["urlhaus"] = uh
@@ -1134,26 +1858,30 @@ def run_threat_intel(email, urls_in_email=None):
         results["confirmed_phishing"] = True
         results["signals"].append("URLhaus: Domain hosts active malware/phishing URLs")
 
-    aip = _check_abuseipdb(domain)
+    aip = _check_abuseipdb_ip(_extract_sender_ip(email.get("internetMessageHeaders")))
     results["checks"]["abuseipdb"] = aip
     if aip and isinstance(aip, dict) and aip.get("is_abusive"):
-        results["confidence_boost"] += 0.15
         results["signals"].append(
-            f"AbuseIPDB: Sender IP has {aip['score']}% abuse confidence"
+            f"AbuseIPDB: sending IP {aip.get('ip')} has {aip['score']}% abuse confidence"
         )
 
     us = _check_urlscan(domain)
     results["checks"]["urlscan"] = us
-    if us and isinstance(us, dict):
-        if us.get("malicious"):
+    if us and isinstance(us, dict) and us.get("found"):
+        brands = us.get("brands") or []
+        brand_note = (" impersonating " + ", ".join(brands)) if brands else ""
+        if us.get("verdict") == "malicious":
             results["confirmed_phishing"] = True
             results["signals"].append(
-                "urlscan.io: domain flagged as malicious in prior public scans"
+                f"urlscan.io: {us.get('malicious_scans', 0)} prior scan(s) flagged this domain as malicious{brand_note}"
             )
-        elif us.get("found"):
-            results["confidence_boost"] += 0.05
+        elif us.get("verdict") == "suspicious":
             results["signals"].append(
-                f"urlscan.io: domain has {us.get('scan_count', 0)} prior public scans on file"
+                f"urlscan.io: prior scans scored this domain risky (score {us.get('max_score', 0)}{brand_note})"
+            )
+        else:
+            results["signals"].append(
+                f"urlscan.io: {us.get('scan_count', 0)} prior scans, none flagged malicious"
             )
 
     local_history = _community_check(domain)
@@ -1162,7 +1890,6 @@ def run_threat_intel(email, urls_in_email=None):
     rep = _check_domain_reputation(domain)
     results["checks"]["domain_reputation"] = rep
     if rep["category"] == "suspicious":
-        results["confidence_boost"] += 0.10
         top_signal = rep["signals"][0][1] if rep["signals"] else "Suspicious domain"
         results["signals"].append(f"Domain analysis: {top_signal}")
 
@@ -1343,58 +2070,54 @@ def get_reputation(domain):
     })
 
 
-@app.route("/api/phishtank/status", methods=["GET"])
-def phishtank_status():
-    """Return local threat-feed loading status for diagnostics."""
-    with _phishtank_lock:
-        updated = _phishtank_data["updated_at"]
-        return jsonify({
-            "loaded": bool(updated),
-            "updated_at": updated.isoformat() if updated else None,
-            "entries": _phishtank_data["count"],
-            "unique_domains": len(_phishtank_data["domains"]),
-            "unique_urls": len(_phishtank_data["urls"]),
-        })
-
-
-@app.route("/api/db/status", methods=["GET"])
-def db_status():
-    """Show whether Supabase config and a browser JWT are available."""
-    jwt = _request_jwt()
+@app.route("/api/community-stats", methods=["GET"])
+def get_community_stats():
+    """Return local scan history stats (per-device, informational only)."""
+    db = _load_community_db()
+    domains = db.get("domains", {})
+    total_reports = sum(
+        item.get("phishing", 0) + item.get("safe", 0)
+        for item in domains.values()
+    )
+    phishing_domains = sum(
+        1 for item in domains.values()
+        if item.get("phishing", 0) > item.get("safe", 0)
+    )
     return jsonify({
-        "configured": bool(SUPABASE_URL and SUPABASE_ANON_KEY),
-        "authenticated": bool(_jwt_user_id(jwt)),
+        "total_domains_tracked": len(domains),
+        "total_scan_reports": total_reports,
+        "known_phishing_domains": phishing_domains,
+        "updated": db.get("updated", ""),
+        "note": "Local scan history - shown for info only, does not affect verdicts.",
     })
 
 
 @app.route("/api/report-sender", methods=["POST"])
 @require_csrf
 def report_sender():
-    """Persist an explicit sender-domain report to Supabase threat_reports."""
+    """Persist an explicit sender-domain report locally and, when signed in, to Supabase."""
     data = request.get_json(silent=True) or {}
     domain = (data.get("domain") or "").strip().lower()
-    is_phishing = bool(data.get("is_phishing", True))
+    is_phishing = bool(data.get("is_phishing"))
     if not domain:
         return jsonify({"error": "domain required"}), 400
 
-    jwt = _request_jwt()
-    user_id = _jwt_user_id(jwt)
-    if not (jwt and user_id):
-        return jsonify({"error": "Supabase sign-in required"}), 401
-
     _community_report(domain, is_phishing, user_confirmed=True)
 
-    resp = _supabase_request(
-        "POST", "threat_reports", jwt,
-        json_body={
-            "reporter_id": user_id,
-            "domain": domain,
-            "category": "phishing" if is_phishing else "safe",
-        },
-        prefer="resolution=ignore-duplicates,return=minimal",
-    )
-    if resp is not None and resp.status_code >= 400 and resp.status_code != 409:
-        return jsonify({"error": "Supabase insert failed"}), 502
+    jwt = _request_jwt()
+    user_id = _jwt_user_id(jwt)
+    if jwt and user_id:
+        resp = _supabase_request(
+            "POST", "threat_reports", jwt,
+            json_body={
+                "reporter_id": user_id,
+                "domain": domain,
+                "category": "phishing" if is_phishing else "safe",
+            },
+            prefer="resolution=ignore-duplicates,return=minimal",
+        )
+        if resp is not None and resp.status_code >= 400 and resp.status_code != 409:
+            print(f"WARNING: threat_reports insert failed [{resp.status_code}]: {resp.text[:200]}")
     return jsonify({"ok": True})
 
 
@@ -2083,24 +2806,6 @@ def get_message(message_id):
     return jsonify(_normalize_email(sess, email, idx))
 
 
-@app.route("/api/messages/<path:message_id>/headers", methods=["GET"])
-def get_message_headers(message_id):
-    sess = _current_session()
-    folder = request.args.get("folder")
-    idx, email = _find_email_by_message_id(message_id, sess, folder)
-    if email is None:
-        return jsonify({"error": "Email not found"}), 404
-
-    headers = email.get("internetMessageHeaders") or []
-    if not isinstance(headers, list):
-        headers = []
-    return jsonify({
-        "headers": headers[:100],
-        "count": len(headers),
-        "truncated": len(headers) > 100,
-    })
-
-
 def _fetch_attachment_bytes(sess, message_id, attachment_id):
     """Fetch Outlook attachment bytes for local hash-based analysis."""
     token = sess.graph_token
@@ -2450,12 +3155,40 @@ def auth_photo():
 
 @app.route("/api/sender-dna/<path:sender_addr>", methods=["GET"])
 def sender_dna(sender_addr):
-    """Minimal sender DNA response; full profiling can be restored later."""
+    """Build/retrieve sender DNA profile and compare against a referenced email."""
+    sess = _current_session()
+    addr = sender_addr.lower().strip()
+    emails = _get_email_list(sess, "inbox") + _get_email_list(sess, "junk")
+
+    profile = _build_sender_profile(addr, emails)
+    if profile:
+        with _sender_profiles_lock:
+            _sender_profiles[addr] = profile
+        _persist_sender_profile_to_supabase(addr, profile, _request_jwt())
+
+    message_id = request.args.get("message_id") or request.args.get("id")
+    comparison = None
+    if message_id and profile:
+        target = next((email for email in emails if _message_key(email, -1) == message_id), None)
+        if target is not None:
+            comparison = _compare_to_profile(profile, target)
+
+    if not profile:
+        with _sender_profiles_lock:
+            profile = _sender_profiles.get(addr)
+
+    if not profile:
+        return jsonify({
+            "status": "unknown",
+            "message": "Not enough emails from this sender to build a profile",
+            "profile": None,
+            "comparison": None,
+        })
+
     return jsonify({
-        "sender": sender_addr,
-        "status": "unknown",
-        "profile": None,
-        "comparison": None,
+        "status": "ok",
+        "profile": profile,
+        "comparison": comparison,
     })
 
 
@@ -2619,12 +3352,19 @@ def _score_link(url, url_threats, analyzer):
                   else "trusted" if trusted else "clean" if urlscan_clean else "unknown")
     sources = (url_feed.get("sources") or []) + (host_feed.get("sources") or [])
     checks = []
-    if any("phishtank" in s.lower() for s in sources):
-        checks.append({"src": "PhishTank", "result": "flagged"})
+    if GSB_API_KEY and http_requests:
+        checks.append({
+            "src": "Google Safe Browsing",
+            "result": "flagged" if any("Google Safe Browsing" in s for s in sources) else "clean",
+        })
     if any("urlscan" in s.lower() for s in sources):
         checks.append({"src": "urlscan.io", "result": "malicious" if feed_malicious else "suspicious"})
+    elif host_feed.get("suspicious"):
+        checks.append({"src": "urlscan.io", "result": "suspicious"})
     elif host_feed.get("urlscan_clean"):
         checks.append({"src": "urlscan.io", "result": "clean"})
+    if url_feed.get("vt"):
+        checks.append({"src": "VirusTotal", "result": url_feed["vt"]})
     if any("URLhaus" in s for s in sources):
         checks.append({"src": "URLhaus", "result": "flagged"})
 
@@ -2661,8 +3401,17 @@ def _score_link(url, url_threats, analyzer):
                 ), "model_uncorroborated"
     if feed_suspicious and score < 70:
         score, reason, decided = 70, "Prior urlscan analyses scored this link's host risky.", "reputation_suspicious"
+    gsb_active = bool(GSB_API_KEY and http_requests)
     if urlscan_clean and decided == "structural" and score <= 25:
-        score, reason, decided = 10, "Checked against urlscan - no threats found.", "reputation_clean"
+        vetted = (["Google Safe Browsing"] if gsb_active else []) + ["urlscan"]
+        score, reason, decided = (
+            10,
+            f"Checked against {_join_and(vetted)} - no threats found.",
+            "reputation_clean",
+        )
+    elif gsb_active and decided == "structural" and score <= 22:
+        reason = "Checked against Google Safe Browsing - not flagged; domain is unfamiliar."
+        decided = "reputation_gsb_clean"
     return result(score, reason, decided)
 
 
@@ -3263,6 +4012,4 @@ def get_stats_v2():
 if __name__ == "__main__":
     port = int(os.environ.get("FLASK_PORT", "5050"))
     debug = os.environ.get("PHISHGUARD_DEBUG") == "1"
-    if not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-        _start_phishtank_refresher()
     app.run(host="127.0.0.1", debug=debug, port=port, use_reloader=debug)
