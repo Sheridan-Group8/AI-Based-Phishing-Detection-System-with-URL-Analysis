@@ -5,6 +5,7 @@ Serves the SPA and provides REST API for phishing email analysis.
 
 import base64
 import hashlib
+import hmac
 import html
 import json
 import os
@@ -14,11 +15,13 @@ import socket
 import threading
 import time as _time
 from datetime import datetime, timedelta
+from functools import wraps
 from html.parser import HTMLParser
 from pathlib import Path
+import tempfile as _tempfile
 from urllib.parse import urlencode, urlparse
 
-from flask import Flask, jsonify, redirect, request, send_from_directory, session
+from flask import Flask, Response, jsonify, redirect, request, send_from_directory, session
 
 from phishing_detector import OnnxClassifier, PhishingDetector
 
@@ -60,6 +63,53 @@ _MAX_URLS_PER_EMAIL = 100
 # ─────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.secret_key = secrets.token_hex(32)
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5 MB
+
+_FLASK_PORT = int(os.environ.get("FLASK_PORT", "5050"))
+ALLOWED_ORIGINS = frozenset({
+    f"http://127.0.0.1:{_FLASK_PORT}",
+    f"http://localhost:{_FLASK_PORT}",
+})
+CSRF_HEADER = "X-CSRF-Token"
+LAUNCH_HEADER = "X-Launch-Secret"
+LAUNCH_SECRET = os.environ.get("PHISHGUARD_LAUNCH_SECRET", "")
+
+
+def _resolve_user_data_dir():
+    safe_roots = [Path.home().resolve(), Path(_tempfile.gettempdir()).resolve()]
+    candidates = []
+    env_val = os.environ.get("PHISHGUARD_USER_DATA")
+    if env_val:
+        try:
+            candidates.append(Path(env_val).expanduser().resolve())
+        except (OSError, RuntimeError) as exc:
+            print(f"WARNING: PHISHGUARD_USER_DATA invalid ({exc}); ignoring.")
+    candidates.append((Path.home() / ".phishguard").resolve())
+    candidates.append((Path(_tempfile.gettempdir()) / "phishguard").resolve())
+
+    for candidate in candidates:
+        try:
+            under_safe_root = any(
+                candidate == root or root in candidate.parents
+                for root in safe_roots
+            )
+        except Exception:
+            under_safe_root = False
+        if not under_safe_root:
+            print(f"WARNING: Refusing unsafe data dir {candidate}")
+            continue
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except OSError as exc:
+            print(f"WARNING: Could not create {candidate}: {exc}")
+
+    emergency = Path(_tempfile.mkdtemp(prefix="phishguard-"))
+    print(f"WARNING: Falling back to emergency data dir {emergency}")
+    return emergency
+
+
+USER_DATA_DIR = _resolve_user_data_dir()
 
 # Supabase database integration. The browser sends a Supabase access token in
 # Authorization; Flask uses it with the anon key so database RLS scopes writes.
@@ -242,7 +292,43 @@ def _emit_session_cookie(resp):
 # ─────────────────────────────────────────────────────────────────────────────
 #  Session Log
 # ─────────────────────────────────────────────────────────────────────────────
-LOG_FILE = Path(__file__).parent / "phishguard_log.txt"
+def _origin_ok():
+    origin = request.headers.get("Origin")
+    referer = request.headers.get("Referer")
+    if origin:
+        return origin.rstrip("/") in ALLOWED_ORIGINS
+    if referer:
+        parsed = urlparse(referer)
+        ref_origin = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+        return ref_origin in ALLOWED_ORIGINS
+    if LAUNCH_SECRET:
+        provided = request.headers.get(LAUNCH_HEADER, "")
+        if provided and hmac.compare_digest(provided, LAUNCH_SECRET):
+            return True
+    return False
+
+
+def _launch_secret_ok():
+    if not LAUNCH_SECRET:
+        return True
+    provided = request.headers.get(LAUNCH_HEADER, "")
+    return bool(provided) and hmac.compare_digest(provided, LAUNCH_SECRET)
+
+
+def require_csrf(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not _origin_ok():
+            return jsonify({"error": "Forbidden (bad origin)"}), 403
+        sess = _current_session()
+        token = request.headers.get(CSRF_HEADER, "")
+        if not token or not hmac.compare_digest(token, sess.csrf_token):
+            return jsonify({"error": "Forbidden (bad CSRF token)"}), 403
+        return view(*args, **kwargs)
+    return wrapped
+
+
+LOG_FILE = USER_DATA_DIR / "phishguard_log.txt"
 
 
 def _log_session_event(event, details=None):
@@ -369,7 +455,7 @@ _phishtank_data = {
     "count": 0,
 }
 
-_runtime_dir = Path(os.environ.get("PHISHGUARD_USER_DATA") or Path(__file__).parent)
+_runtime_dir = USER_DATA_DIR
 _COMMUNITY_DB_PATH = _runtime_dir / "local_scan_history.json"
 _community_db_lock = threading.Lock()
 
@@ -438,6 +524,90 @@ def _vt_lookup_hash(sha256):
     with _vt_cache_lock:
         _vt_cache[sha256] = {"result": result, "cached_at": datetime.now()}
     return result
+
+
+VT_MAX_FILES_PER_SCAN = 5
+VT_MAX_FILE_BYTES = 32 * 1024 * 1024
+
+
+def _vt_upload_file(content_bytes, filename="file"):
+    """Upload file bytes to VirusTotal for an explicit user-requested scan."""
+    if not VIRUSTOTAL_API_KEY or not http_requests:
+        return None
+    if not content_bytes:
+        return {"error": "no file bytes", "status": 0}
+    if len(content_bytes) > VT_MAX_FILE_BYTES:
+        return {
+            "error": f"file too large to upload (> {VT_MAX_FILE_BYTES // (1024 * 1024)} MB)",
+            "status": 413,
+        }
+    try:
+        resp = http_requests.post(
+            f"{VT_API_BASE}/files",
+            headers={
+                "x-apikey": VIRUSTOTAL_API_KEY,
+                "User-Agent": "PhishGuard/2.0 (+phishguard-capstone)",
+            },
+            files={"file": (filename or "file", content_bytes)},
+            timeout=(5, 60),
+        )
+    except Exception as exc:
+        return {"error": f"network: {exc}", "status": 0}
+    if resp.status_code == 401:
+        return {"error": "VT api key invalid or revoked", "status": 401}
+    if resp.status_code == 429:
+        return {"error": "VT rate limit hit; try again in a minute", "status": 429}
+    if resp.status_code not in (200, 201):
+        return {"error": f"http {resp.status_code}", "status": resp.status_code}
+    try:
+        analysis_id = resp.json().get("data", {}).get("id", "")
+    except Exception as exc:
+        return {"error": f"parse: {exc}", "status": 200}
+    if not analysis_id:
+        return {"error": "no analysis id returned", "status": 200}
+    return {"analysis_id": analysis_id}
+
+
+def _vt_poll_analysis(analysis_id):
+    """Poll a VirusTotal file analysis and return a normalized verdict."""
+    if not VIRUSTOTAL_API_KEY or not http_requests or not analysis_id:
+        return None
+    try:
+        resp = http_requests.get(
+            f"{VT_API_BASE}/analyses/{analysis_id}",
+            headers={
+                "x-apikey": VIRUSTOTAL_API_KEY,
+                "User-Agent": "PhishGuard/2.0 (+phishguard-capstone)",
+            },
+            timeout=HTTP_TIMEOUT,
+        )
+    except Exception as exc:
+        return {"error": f"network: {exc}", "status": 0}
+    if resp.status_code == 429:
+        return {"error": "VT rate limit hit; try again in a minute", "status": 429}
+    if resp.status_code != 200:
+        return {"error": f"http {resp.status_code}", "status": resp.status_code}
+    try:
+        payload = resp.json()
+        attrs = payload.get("data", {}).get("attributes", {}) or {}
+        status = attrs.get("status", "queued")
+        sha = ((payload.get("meta", {}) or {}).get("file_info", {}) or {}).get("sha256", "")
+    except Exception as exc:
+        return {"error": f"parse: {exc}", "status": 200}
+    if status != "completed":
+        return {"status": status}
+    stats = attrs.get("stats", {}) or {}
+    return {
+        "status": "completed",
+        "found": True,
+        "sha256": sha,
+        "malicious": int(stats.get("malicious", 0) or 0),
+        "suspicious": int(stats.get("suspicious", 0) or 0),
+        "harmless": int(stats.get("harmless", 0) or 0),
+        "undetected": int(stats.get("undetected", 0) or 0),
+        "total": int(sum(v or 0 for v in stats.values())),
+        "permalink": f"https://www.virustotal.com/gui/file/{sha}" if sha else "",
+    }
 
 
 def _check_urlscan(domain):
@@ -1120,7 +1290,7 @@ def index():
 def get_csrf_token():
     """Compatibility token for the Electron renderer's secure fetch wrapper."""
     sess = _current_session()
-    return jsonify({"csrf": sess.csrf_token})
+    return jsonify({"csrf": sess.csrf_token, "launchSecret": bool(LAUNCH_SECRET)})
 
 
 @app.route("/api/settings", methods=["GET"])
@@ -1136,6 +1306,8 @@ def get_settings():
 @app.route("/api/log", methods=["GET"])
 def get_log():
     """Return the session log file contents."""
+    if not _origin_ok() or not _launch_secret_ok():
+        return jsonify({"error": "Forbidden"}), 403
     if not LOG_FILE.exists():
         return jsonify({"log": "No session activity recorded yet."})
     text = LOG_FILE.read_text(encoding="utf-8")
@@ -1145,6 +1317,8 @@ def get_log():
 @app.route("/api/log/download", methods=["GET"])
 def download_log():
     """Download the session log as a text file."""
+    if not _origin_ok() or not _launch_secret_ok():
+        return jsonify({"error": "Forbidden"}), 403
     if not LOG_FILE.exists():
         return "No log file yet.", 404
     return send_from_directory(
@@ -1194,6 +1368,7 @@ def db_status():
 
 
 @app.route("/api/report-sender", methods=["POST"])
+@require_csrf
 def report_sender():
     """Persist an explicit sender-domain report to Supabase threat_reports."""
     data = request.get_json(silent=True) or {}
@@ -1349,6 +1524,7 @@ def auth_status():
 
 
 @app.route("/api/auth/connect", methods=["POST"])
+@require_csrf
 def auth_connect():
     """Start OAuth flow — returns the Microsoft login URL."""
     sess = _current_session()
@@ -1392,6 +1568,7 @@ def auth_connect():
 
 
 @app.route("/api/auth/external-start", methods=["POST"])
+@require_csrf
 def auth_external_start():
     """Register the renderer nonce before browser-based Supabase OAuth."""
     data = request.get_json(silent=True) or {}
@@ -1563,6 +1740,7 @@ def auth_external_poll():
 
 
 @app.route("/api/auth/supabase-provider", methods=["POST"])
+@require_csrf
 def auth_supabase_provider():
     """Use Supabase's Microsoft provider token as the Graph token."""
     sess = _current_session()
@@ -1732,6 +1910,7 @@ def auth_callback():
 
 
 @app.route("/api/auth/disconnect", methods=["POST"])
+@require_csrf
 def auth_disconnect():
     """Disconnect from Outlook and log session summary."""
     sess = _current_session()
@@ -1765,6 +1944,7 @@ def auth_disconnect():
 
 
 @app.route("/api/auth/refresh", methods=["POST"])
+@require_csrf
 def auth_refresh_emails():
     """Re-fetch emails from Outlook."""
     sess = _current_session()
@@ -1943,6 +2123,33 @@ def _fetch_attachment_bytes(sess, message_id, attachment_id):
     return None
 
 
+def _vt_scan_attachments(sess, message_id, attachments):
+    """Hash attachments locally and look up the hash on VirusTotal."""
+    if not VIRUSTOTAL_API_KEY or not attachments:
+        return attachments
+    scanned = 0
+    for attachment in attachments:
+        if not isinstance(attachment, dict) or "vt" in attachment:
+            continue
+        if scanned >= VT_MAX_FILES_PER_SCAN:
+            break
+        size = attachment.get("size") or 0
+        if size and size > VT_MAX_FILE_BYTES:
+            continue
+        attachment_id = attachment.get("id", "")
+        if not attachment_id:
+            continue
+        content_bytes = _fetch_attachment_bytes(sess, message_id, attachment_id)
+        if not content_bytes:
+            continue
+        scanned += 1
+        sha = hashlib.sha256(content_bytes).hexdigest()
+        result = _vt_lookup_hash(sha)
+        if isinstance(result, dict) and "error" not in result:
+            attachment["vt"] = result
+    return attachments
+
+
 def _attachment_name(attachment):
     """Return a display name for either Graph attachment dicts or mock strings."""
     if isinstance(attachment, dict):
@@ -1955,16 +2162,34 @@ def _classify_attachment(name):
     lower = (name or "").lower()
     parts = [p for p in lower.split(".") if p]
     ext = parts[-1] if parts else ""
-    dangerous = {"exe", "scr", "bat", "cmd", "com", "ps1", "vbs", "js", "jar", "msi"}
-    caution = {"zip", "rar", "7z", "iso", "img", "docm", "xlsm", "pptm", "html", "htm"}
+    dangerous = {
+        "exe", "scr", "bat", "cmd", "com", "pif", "js", "jse", "vbs",
+        "vbe", "wsf", "wsh", "hta", "jar", "msi", "msix", "ps1",
+        "lnk", "iso", "img", "reg", "cpl", "dll", "vbscript", "scf",
+    }
+    macro = {"docm", "xlsm", "pptm", "dotm", "xltm", "potm", "xlam", "ppam"}
+    archive = {"zip", "rar", "7z", "gz", "tar", "cab", "ace", "bz2", "tgz"}
+    doc = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv",
+           "jpg", "jpeg", "png", "gif", "zip", "rtf"}
 
-    if len(parts) >= 2 and parts[-2] in {"pdf", "doc", "docx", "xls", "xlsx"} and ext in dangerous:
+    if len(parts) >= 3 and parts[-2] in doc and ext in dangerous:
         return "dangerous", f"Double extension - disguised executable (.{parts[-2]}.{ext})."
     if ext in dangerous:
         return "dangerous", f"Executable/script file (.{ext}) - can run code if opened."
-    if ext in caution:
-        return "caution", f"Attachment type (.{ext}) deserves extra caution."
-    return "safe", "No risky file type detected."
+    if ext in macro:
+        return "caution", f"Macro-enabled Office document (.{ext}) - can run malicious macros."
+    if ext in archive:
+        return "caution", f"Archive (.{ext}) - may hide a malicious file inside."
+    return "safe", ""
+
+
+def _find_attachment(email, attachment_id):
+    for attachment in (email.get("attachments", []) or []):
+        if not isinstance(attachment, dict):
+            continue
+        if attachment.get("id") == attachment_id or attachment.get("name") == attachment_id:
+            return attachment
+    return None
 
 
 def _load_attachment_metadata(sess, message_id, email):
@@ -2027,23 +2252,17 @@ def get_message_attachments(message_id):
 
 
 @app.route("/api/messages/<path:message_id>/attachments/<path:attachment_id>/analyze", methods=["POST"])
+@require_csrf
 def analyze_message_attachment(message_id, attachment_id):
     sess = _current_session()
     idx, email = _find_email_by_message_id(message_id, sess)
     if email is None:
         return jsonify({"error": "Email not found"}), 404
 
-    attachments = email.get("attachments", []) or []
-    att = None
-    for item in attachments:
-        if not isinstance(item, dict):
-            continue
-        if item.get("id") == attachment_id or item.get("name") == attachment_id:
-            att = item
-            break
-
+    _load_attachment_metadata(sess, message_id, email)
+    att = _find_attachment(email, attachment_id)
     if att is None:
-        att = {"id": attachment_id, "name": attachment_id}
+        return jsonify({"error": "Attachment not found"}), 404
 
     name = att.get("name", "") or att.get("filename", "") or "file"
     if not VIRUSTOTAL_API_KEY:
@@ -2093,38 +2312,74 @@ def analyze_message_attachment(message_id, attachment_id):
 
 
 @app.route("/api/messages/<path:message_id>/attachments/<path:attachment_id>/deepscan", methods=["POST"])
+@require_csrf
 def deepscan_message_attachment(message_id, attachment_id):
+    """Explicit VirusTotal upload. Sends file contents only on user action."""
     sess = _current_session()
     idx, email = _find_email_by_message_id(message_id, sess)
     if email is None:
         return jsonify({"error": "Email not found"}), 404
 
-    attachment = None
-    for item in email.get("attachments", []) or []:
-        if isinstance(item, dict) and (item.get("id") == attachment_id or item.get("name") == attachment_id):
-            attachment = item
-            break
+    _load_attachment_metadata(sess, message_id, email)
+    attachment = _find_attachment(email, attachment_id)
+    if attachment is None:
+        return jsonify({"error": "Attachment not found"}), 404
 
-    name = _attachment_name(attachment or attachment_id)
-    return jsonify({
-        "configured": False,
-        "analyzed": False,
-        "name": name,
-        "message": "Deep attachment uploads are not enabled in this PHISHGUARD build.",
-    })
+    name = _attachment_name(attachment)
+    if not VIRUSTOTAL_API_KEY:
+        return jsonify({"configured": False, "name": name,
+                        "message": "VirusTotal API key not configured."})
+
+    content_bytes = _fetch_attachment_bytes(sess, message_id, attachment.get("id", ""))
+    if not content_bytes:
+        return jsonify({"configured": True, "analyzed": False, "name": name,
+                        "message": "Could not fetch attachment bytes - deep scan is only available for real Outlook mail."})
+
+    sha = hashlib.sha256(content_bytes).hexdigest()
+    known = _vt_lookup_hash(sha)
+    if isinstance(known, dict) and known.get("found"):
+        attachment["vt"] = known
+        return jsonify({"configured": True, "analyzed": True, "uploaded": False,
+                        "name": name, "size": len(content_bytes), **known})
+
+    upload = _vt_upload_file(content_bytes, name)
+    if upload is None:
+        return jsonify({"configured": False, "name": name})
+    if "error" in upload:
+        return jsonify({"configured": True, "analyzed": False, "name": name,
+                        "error": upload["error"], "status": upload.get("status", 0)})
+    return jsonify({"configured": True, "uploaded": True, "name": name,
+                    "sha256": sha, "status": "pending",
+                    "analysis_id": upload["analysis_id"]})
 
 
 @app.route("/api/messages/<path:message_id>/attachments/<path:attachment_id>/deepscan/<path:analysis_id>", methods=["GET"])
 def deepscan_message_attachment_status(message_id, attachment_id, analysis_id):
-    return jsonify({
-        "configured": False,
-        "analyzed": False,
-        "status": "unavailable",
-        "message": "Deep attachment uploads are not enabled in this PHISHGUARD build.",
-    })
+    sess = _current_session()
+    idx, email = _find_email_by_message_id(message_id, sess)
+    if email is None:
+        return jsonify({"error": "Email not found"}), 404
+    result = _vt_poll_analysis(analysis_id)
+    if result is None:
+        return jsonify({"configured": False})
+    if "error" in result:
+        return jsonify({"analyzed": False, "error": result["error"],
+                        "status": result.get("status", 0)})
+    if result.get("status") != "completed":
+        return jsonify({"analyzed": False, "status": result.get("status", "queued")})
+    _load_attachment_metadata(sess, message_id, email)
+    attachment = _find_attachment(email, attachment_id)
+    if attachment is not None:
+        attachment["vt"] = {
+            key: result.get(key)
+            for key in ("found", "malicious", "suspicious", "harmless",
+                        "undetected", "total", "permalink", "sha256")
+        }
+    return jsonify({"analyzed": True, **result})
 
 
 @app.route("/api/messages/<path:message_id>/move-to-junk", methods=["POST"])
+@require_csrf
 def move_message_to_junk(message_id):
     sess = _current_session()
     idx, email = _find_email_by_message_id(message_id, sess, "inbox")
@@ -2171,7 +2426,25 @@ def move_message_to_junk(message_id):
 
 @app.route("/api/auth/photo", methods=["GET"])
 def auth_photo():
-    """The original backend does not fetch profile photos."""
+    sess = _current_session()
+    if not sess.graph_token["access_token"] or not http_requests:
+        return "", 404
+    try:
+        resp = http_requests.get(
+            f"{GRAPH_URL}/me/photo/$value",
+            headers={"Authorization": f"Bearer {sess.graph_token['access_token']}"},
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            return Response(
+                resp.content,
+                mimetype=resp.headers.get("Content-Type", "image/jpeg"),
+            )
+        if resp.status_code == 401:
+            sess.graph_token["access_token"] = None
+            sess.graph_token["expiry"] = None
+    except Exception:
+        pass
     return "", 404
 
 
@@ -2603,16 +2876,44 @@ def _assess_sender(threat_intel):
 
 def _assess_attachments(attachments):
     items, score, findings, tags = [], 0, [], []
+    vt_checked = False
     for attachment in (attachments or []):
         name = _attachment_name(attachment)
         risk, reason = _classify_attachment(name)
-        items.append({"name": name, "risk": risk, "reason": reason, "vt": None})
-        if risk == "dangerous":
+        vt = attachment.get("vt") if isinstance(attachment, dict) else None
+        vt_out = None
+        if isinstance(vt, dict) and vt.get("found") is not None:
+            vt_checked = True
+            malicious = int(vt.get("malicious", 0) or 0)
+            suspicious = int(vt.get("suspicious", 0) or 0)
+            total = int(vt.get("total", 0) or 0)
+            vt_out = {
+                "malicious": malicious,
+                "suspicious": suspicious,
+                "total": total,
+                "found": bool(vt.get("found")),
+                "permalink": vt.get("permalink", ""),
+            }
+            if malicious >= 1:
+                risk = "malicious"
+                reason = f"VirusTotal: {malicious} of {total} security engines flagged this file as malicious."
+            elif suspicious >= 2:
+                if risk == "safe":
+                    risk = "caution"
+                reason = reason or f"VirusTotal: {suspicious} engines flagged this file as suspicious."
+        items.append({"name": name, "risk": risk, "reason": reason, "vt": vt_out})
+        if risk == "malicious":
+            score = max(score, 96)
+        elif risk == "dangerous":
             score = max(score, 90)
         elif risk == "caution":
             score = max(score, 55)
+    malicious = [item["name"] for item in items if item["risk"] == "malicious"]
     danger = [item["name"] for item in items if item["risk"] == "dangerous"]
     caution = [item["name"] for item in items if item["risk"] == "caution"]
+    if malicious:
+        findings.append("VirusTotal flagged a malicious attachment: " + malicious[0])
+        tags.append("malicious_attachment")
     if danger:
         findings.append("Dangerous attachment: " + danger[0])
         tags.append("dangerous_attachment")
@@ -2622,7 +2923,8 @@ def _assess_attachments(attachments):
     if not items:
         summary = "No attachments."
     elif not findings:
-        summary = f"{len(items)} attachment(s), none risky."
+        summary = (f"{len(items)} attachment(s) - checked on VirusTotal, none flagged."
+                   if vt_checked else f"{len(items)} attachment(s), none risky.")
     else:
         summary = findings[0]
     return {"score": score, "level": _risk_level(score), "summary": summary,
@@ -2716,7 +3018,10 @@ def _compute_assessment(model_score, full_text, urls, url_threats,
             threats.append({"title": "Provider-Flagged Sender", "severity": "medium",
                             "desc": "Microsoft's mail protection flagged this message."})
     file_tags = files.get("tags", [])
-    if "dangerous_attachment" in file_tags:
+    if "malicious_attachment" in file_tags:
+        threats.append({"title": "Malicious Attachment", "severity": "high",
+                        "desc": files["summary"] + " - do not open it."})
+    elif "dangerous_attachment" in file_tags:
         threats.append({"title": "Dangerous Attachment", "severity": "high",
                         "desc": files["summary"] + " - do not open it."})
     elif "risky_attachment" in file_tags:
@@ -2845,7 +3150,9 @@ def _scan_email_common(sess, email, idx):
     else:
         from_addr = email.get("sender", "") if isinstance(email.get("sender"), str) else ""
 
-    attachments = _load_attachment_metadata(sess, _message_key(email, idx), email)
+    message_id = _message_key(email, idx)
+    attachments = _load_attachment_metadata(sess, message_id, email)
+    attachments = _vt_scan_attachments(sess, message_id, attachments)
     assessment = _compute_assessment(
         model_score,
         full,
@@ -2863,7 +3170,6 @@ def _scan_email_common(sess, email, idx):
     risk_score = int(assessment["overall"])
     confidence = risk_score / 100.0 if prediction == 1 else (1.0 - risk_score / 100.0)
 
-    message_id = _message_key(email, idx)
     result = {
         "id": message_id,
         "messageId": message_id,
@@ -2888,6 +3194,7 @@ def _scan_email_common(sess, email, idx):
 
 
 @app.route("/api/messages/<path:message_id>/scan", methods=["POST"])
+@require_csrf
 def scan_message(message_id):
     sess = _current_session()
     idx, email = _find_email_by_message_id(message_id, sess)
@@ -2901,6 +3208,7 @@ def scan_message(message_id):
 
 
 @app.route("/api/scan-all", methods=["POST"])
+@require_csrf
 def scan_all_v2():
     sess = _current_session()
     if not detector.is_trained:
