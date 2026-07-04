@@ -2348,7 +2348,8 @@ _EXTERNAL_CALLBACK_HTML = """<!DOCTYPE html>
   var hash = new URLSearchParams((window.location.hash || '').replace(/^#/, ''));
   var query = new URLSearchParams(window.location.search || '');
   var nonce = query.get('nonce');
-  var accessToken = hash.get('access_token');
+  var code = query.get('code') || hash.get('code') || '';
+  var accessToken = hash.get('access_token') || '';
   var refreshToken = hash.get('refresh_token') || '';
   var providerToken = hash.get('provider_token') || '';
   var providerRefreshToken = hash.get('provider_refresh_token') || '';
@@ -2367,7 +2368,7 @@ _EXTERNAL_CALLBACK_HTML = """<!DOCTYPE html>
   }
 
   if (err) { fail((errDesc || err) + ' - you can close this tab.'); return; }
-  if (!nonce || !accessToken) {
+  if (!nonce || (!accessToken && !code)) {
     fail('Missing session data. You can close this tab and try again.');
     return;
   }
@@ -2377,6 +2378,7 @@ _EXTERNAL_CALLBACK_HTML = """<!DOCTYPE html>
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       nonce: nonce,
+      code: code,
       access_token: accessToken,
       refresh_token: refreshToken,
       provider_token: providerToken,
@@ -2402,21 +2404,25 @@ _EXTERNAL_CALLBACK_HTML = """<!DOCTYPE html>
 
 @app.route("/auth/external-callback")
 def auth_external_callback():
-    """Receive Supabase OAuth redirect and deliver URL hash tokens to Flask."""
+    """Receive Supabase OAuth redirect and deliver PKCE code/tokens to Flask."""
     return _EXTERNAL_CALLBACK_HTML
 
 
 @app.route("/api/auth/external-deliver", methods=["POST"])
 def auth_external_deliver():
-    """Browser callback page posts Supabase session tokens for Electron to poll."""
+    """Browser callback page posts Supabase PKCE code or tokens for Electron to poll."""
     data = request.get_json(silent=True) or {}
-    nonce = str(data.get("nonce", "")).strip()
+    def clean(value):
+        return "" if value is None else str(value).strip()
+
+    nonce = clean(data.get("nonce"))
     if not nonce:
         return jsonify({"error": "nonce required"}), 400
 
-    access_token = str(data.get("access_token", "")).strip()
-    if not access_token:
-        return jsonify({"error": "missing access_token"}), 400
+    access_token = clean(data.get("access_token"))
+    code = clean(data.get("code"))
+    if not access_token and not code:
+        return jsonify({"error": "missing access_token or code"}), 400
 
     try:
         expires_in = int(data.get("expires_in") or 3600)
@@ -2431,9 +2437,10 @@ def auth_external_deliver():
             return jsonify({"error": "already delivered"}), 409
         entry["tokens"] = {
             "access_token": access_token,
-            "refresh_token": str(data.get("refresh_token", "")).strip(),
-            "provider_token": str(data.get("provider_token", "")).strip(),
-            "provider_refresh_token": str(data.get("provider_refresh_token", "")).strip(),
+            "code": code,
+            "refresh_token": clean(data.get("refresh_token")),
+            "provider_token": clean(data.get("provider_token")),
+            "provider_refresh_token": clean(data.get("provider_refresh_token")),
             "expires_in": expires_in,
         }
         entry["delivered_at"] = datetime.now()
