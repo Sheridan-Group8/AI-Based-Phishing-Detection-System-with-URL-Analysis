@@ -7,6 +7,7 @@ import base64
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import os
 import re
@@ -73,6 +74,11 @@ ALLOWED_ORIGINS = frozenset({
 CSRF_HEADER = "X-CSRF-Token"
 LAUNCH_HEADER = "X-Launch-Secret"
 LAUNCH_SECRET = os.environ.get("PHISHGUARD_LAUNCH_SECRET", "")
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_DOMAIN_RE = re.compile(r"^(?=.{1,253}\.?$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\.?$")
 
 
 def _resolve_user_data_dir():
@@ -107,6 +113,22 @@ def _resolve_user_data_dir():
     emergency = Path(_tempfile.mkdtemp(prefix="phishguard-"))
     print(f"WARNING: Falling back to emergency data dir {emergency}")
     return emergency
+
+
+def _is_uuid(value):
+    return bool(isinstance(value, str) and _UUID_RE.fullmatch(value.strip()))
+
+
+def _is_public_domain(value):
+    domain = (value or "").strip().lower().rstrip(".")
+    if not domain or len(domain) > 253 or domain in {"localhost", "local"}:
+        return False
+    try:
+        ip = ipaddress.ip_address(domain)
+        return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved)
+    except ValueError:
+        pass
+    return bool(_DOMAIN_RE.fullmatch(domain))
 
 
 USER_DATA_DIR = _resolve_user_data_dir()
@@ -277,6 +299,19 @@ def _current_session():
 
 @app.after_request
 def _emit_session_cookie(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), clipboard-read=(), clipboard-write=()",
+    )
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    resp.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+    if request.path.startswith("/api/"):
+        resp.headers.setdefault("Cache-Control", "no-store, max-age=0")
+        resp.headers.setdefault("Pragma", "no-cache")
+
     sid = request.environ.get("phishguard.sid")
     if sid and request.environ.get("phishguard.set_cookie"):
         resp.set_cookie(
@@ -2027,6 +2062,8 @@ def get_settings():
     return jsonify({
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_ANON_KEY),
         "graph_connected": bool(sess.graph_token["access_token"] and sess.live_mode),
+        "logging_enabled": False,
+        "user_data_dir": str(USER_DATA_DIR),
     })
 
 
@@ -2057,6 +2094,8 @@ def download_log():
 @app.route("/api/reputation/<domain>", methods=["GET"])
 def get_reputation(domain):
     """Return worldwide domain reputation."""
+    if not _is_public_domain(domain):
+        return jsonify({"error": "invalid domain"}), 400
     rep = _check_domain_reputation(domain)
     # Convert signal tuples to serializable dicts
     serializable_signals = [
@@ -2101,6 +2140,8 @@ def report_sender():
     is_phishing = bool(data.get("is_phishing"))
     if not domain:
         return jsonify({"error": "domain required"}), 400
+    if not _is_public_domain(domain):
+        return jsonify({"error": "invalid domain"}), 400
 
     _community_report(domain, is_phishing, user_confirmed=True)
 
@@ -2256,8 +2297,8 @@ def auth_connect():
 
     data = request.get_json(silent=True) or {}
     client_id = data.get("client_id", "").strip()
-    if not client_id:
-        return jsonify({"error": "Client ID required"}), 400
+    if not _is_uuid(client_id):
+        return jsonify({"error": "Client ID must be a UUID"}), 400
 
     # Store client_id and PKCE server-side (not in session — popup may lose cookie)
     verifier, challenge = _generate_pkce()
