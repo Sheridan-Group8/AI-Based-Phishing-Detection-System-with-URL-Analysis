@@ -106,7 +106,7 @@ class URLAnalyzer:
                 url_lower = 'http://' + url_lower
 
             parsed = urlparse(url_lower)
-            domain = parsed.netloc or ''
+            domain = parsed.hostname or parsed.netloc or ''
             path = parsed.path or ''
         except Exception:
             return features
