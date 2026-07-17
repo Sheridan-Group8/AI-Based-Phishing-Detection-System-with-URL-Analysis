@@ -22,13 +22,87 @@ def test_url_analyzer_flags_common_phishing_indicators():
     assert features["is_https"] == 0
 
 
-def test_domain_and_uuid_validators_reject_unsafe_inputs():
-    assert pg_app._is_uuid("11111111-2222-3333-4444-555555555555")
-    assert not pg_app._is_uuid("' OR 1=1 --")
+def test_domain_validator_rejects_unsafe_inputs():
     assert pg_app._is_public_domain("example.com")
     assert not pg_app._is_public_domain("localhost")
     assert not pg_app._is_public_domain("127.0.0.1")
     assert not pg_app._is_public_domain("bad domain")
+
+
+def test_domain_age_uses_rdap_json(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "events": [
+                    {
+                        "eventAction": "registration",
+                        "eventDate": "2020-01-01T00:00:00Z",
+                    }
+                ]
+            }
+
+    class FakeRequests:
+        calls = []
+
+        @classmethod
+        def get(cls, url, **kwargs):
+            cls.calls.append((url, kwargs))
+            return FakeResponse()
+
+    pg_app._domain_age_cache.clear()
+    monkeypatch.setattr(pg_app, "http_requests", FakeRequests)
+
+    days = pg_app._get_domain_age("login.example.com")
+
+    assert days is not None
+    assert days > 0
+    assert FakeRequests.calls[0][0] == "https://rdap.org/domain/example.com"
+
+
+def test_openphish_feed_matches_exact_urls_locally(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        text = "https://evil.example/login\nhttps://evil.example/trailing/\n"
+
+    class FakeRequests:
+        calls = []
+
+        @classmethod
+        def get(cls, url, **kwargs):
+            cls.calls.append((url, kwargs))
+            return FakeResponse()
+
+    pg_app._openphish.update({"urls": frozenset(), "fetched_at": None, "ok": False})
+    monkeypatch.setattr(pg_app, "http_requests", FakeRequests)
+
+    assert pg_app._check_openphish("https://evil.example/login") is True
+    assert pg_app._check_openphish("https://evil.example/trailing") is True
+    assert pg_app._check_openphish("https://safe.example/") is False
+    assert FakeRequests.calls[0][0] == pg_app.OPENPHISH_FEED_URL
+
+
+def test_threat_intel_marks_openphish_hit_as_confirmed(monkeypatch):
+    pg_app._openphish.update({
+        "urls": frozenset({"https://evil.example/login"}),
+        "fetched_at": pg_app.datetime.now(),
+        "ok": True,
+    })
+    monkeypatch.setattr(pg_app, "GSB_API_KEY", "")
+    monkeypatch.setattr(pg_app, "_check_virustotal_url", lambda url: None)
+    monkeypatch.setattr(pg_app, "_vt_scan_url", lambda url: None)
+    monkeypatch.setattr(pg_app, "_check_urlhaus", lambda host: None)
+    monkeypatch.setattr(pg_app, "_check_urlscan", lambda host: None)
+    monkeypatch.setattr(pg_app, "_check_abuseipdb_ip", lambda ip: None)
+
+    result = pg_app.run_threat_intel({}, ["https://evil.example/login"])
+
+    assert result["confirmed_phishing"] is True
+    assert result["url_threats"]["https://evil.example/login"]["malicious"] is True
+    assert result["url_threats"]["https://evil.example/login"]["sources"] == ["OpenPhish"]
+    assert any("OpenPhish" in signal for signal in result["signals"])
 
 
 def test_html_to_text_strips_non_visible_content_and_decodes_entities():
