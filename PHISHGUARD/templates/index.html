@@ -80,7 +80,6 @@
                 <div class="shortcut-row"><span class="shortcut-label">Move to junk</span><span class="shortcut-key">J</span></div>
                 <div class="shortcut-row"><span class="shortcut-label">Refresh emails</span><span class="shortcut-key">R</span></div>
                 <div class="shortcut-row"><span class="shortcut-label">Star / unstar</span><span class="shortcut-key">F</span></div>
-                <div class="shortcut-row"><span class="shortcut-label">Scan all emails</span><span class="shortcut-key">A</span></div>
                 <div class="shortcut-row"><span class="shortcut-label">Show this help</span><span class="shortcut-key">?</span></div>
             </div>
             <div class="shortcuts-hint">Press any key to dismiss</div>
@@ -274,10 +273,7 @@
                 <div class="search-autocomplete" id="searchAutocomplete" style="display:none;"></div>
             </div>
             <div class="topbar-actions">
-                <button class="btn btn-ghost btn-sm" id="scanAllBtn" title="Scan all emails">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
-                    Rescan
-                </button>
+                <!-- Global scan-all was removed; scans now happen per email. -->
                 <!-- Refresh kept (icon-only) + hidden stat mirrors for JS -->
                 <button class="btn btn-ghost btn-sm topbar-icon-only" id="refreshBtn" title="Refresh emails">
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
@@ -287,6 +283,16 @@
                 </div>
             </div>
         </header>
+
+        <!-- Shown when the user is signed into PhishGuard but Outlook is not connected. -->
+        <div class="reconnect-banner" id="reconnectBanner" style="display:none;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            <span class="reconnect-banner-text">You're signed in, but your Outlook inbox isn't connected - showing sample emails. Reconnect to scan your real mail.</span>
+            <button class="btn btn-primary btn-sm" id="reconnectBannerBtn">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+                Reconnect to Outlook
+            </button>
+        </div>
 
         <!-- ============ MAIN LAYOUT (email list + preview) ============ -->
         <div class="main-layout">
@@ -327,10 +333,10 @@
                             <div class="dashboard-pulse"></div>
                             <div class="dashboard-pulse"></div>
                             <div class="dashboard-pulse"></div>
-                            <svg class="dashboard-shield" width="72" height="72" viewBox="0 0 24 24" fill="none">
-                                <path d="M12 2L3 7v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5z"
-                                      stroke="var(--accent)" stroke-width="1.5" fill="none"/>
-                                <path d="M9 12l2 2 4-4" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            <svg class="dashboard-shield" width="72" height="72" viewBox="0 0 48 56" fill="none">
+                                <path d="M24 3 L41.5 9.6 V25.8 C41.5 38.4 34 48.6 24 53 14 48.6 6.5 38.4 6.5 25.8 V9.6 Z"
+                                      fill="var(--accent)" fill-opacity="0.14" stroke="var(--accent)" stroke-width="2.2" stroke-linejoin="round"/>
+                                <path d="M16.5 27.5 L21.5 32.5 L31.5 22" stroke="var(--accent)" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
                             </svg>
                             <div class="dashboard-particles">
                                 <div class="dashboard-particle"></div>
@@ -375,6 +381,27 @@
                         <div class="security-tip" id="securityTip">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
                             <span>Select a message and run a scan to receive a comprehensive threat analysis.</span>
+                        </div>
+
+                        <div class="dash-insights" id="dashInsights" style="display:none;">
+                            <div class="dash-ins-card">
+                                <div class="dash-ins-head">Threat Breakdown</div>
+                                <div class="dash-bar">
+                                    <span class="seg-danger" id="dashBarDanger" style="width:0"></span>
+                                    <span class="seg-warn" id="dashBarWarn" style="width:0"></span>
+                                    <span class="seg-safe" id="dashBarSafe" style="width:0"></span>
+                                </div>
+                                <div class="dash-bar-legend">
+                                    <span><i style="background:var(--danger)"></i>Dangerous <b id="dashLegDanger">0</b></span>
+                                    <span><i style="background:var(--warning)"></i>Suspicious <b id="dashLegWarn">0</b></span>
+                                    <span><i style="background:var(--success)"></i>Safe <b id="dashLegSafe">0</b></span>
+                                </div>
+                            </div>
+                            <div class="dash-ins-card">
+                                <div class="dash-ins-head">Common Threats</div>
+                                <div class="dash-threats-list" id="dashThreatsList"></div>
+                            </div>
+                            <div class="dash-lastscan" id="dashLastScan"></div>
                         </div>
                     </div>
                 </div>
@@ -443,51 +470,6 @@
                              allow-scripts, no remote resources via CSP). Content is also
                              sanitised client-side before being written via srcdoc. -->
                         <iframe class="preview-body-html" id="previewBodyHtml" sandbox="" referrerpolicy="no-referrer" style="display:none;"></iframe>
-
-                        <!-- View Detailed Security Report (shown after scan) -->
-                        <div class="detail-report-toggle-wrap" id="detailReportToggleWrap" style="display:none;">
-                            <button class="btn btn-ghost detail-report-btn" id="detailReportBtn">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-                                View Detailed Security Report
-                            </button>
-                        </div>
-
-                        <!-- Hidden panels that show inside detailed report -->
-                        <div class="trust-score-badge" id="trustScoreBadge" style="display:none;">
-                            <div class="trust-score-ring" id="trustScoreRing">
-                                <svg viewBox="0 0 36 36" class="trust-score-svg">
-                                    <path class="trust-score-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
-                                    <path class="trust-score-fill" id="trustScoreFill" stroke-dasharray="0, 100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
-                                </svg>
-                                <span class="trust-score-num" id="trustScoreNum">--</span>
-                            </div>
-                            <div class="trust-score-info">
-                                <div class="trust-score-label" id="trustScoreLabel">Analyzing...</div>
-                                <div class="trust-score-detail" id="trustScoreDetail"></div>
-                            </div>
-                        </div>
-                        <div class="reputation-panel" id="reputationPanel" style="display:none;">
-                            <div class="rep-header">Sender Reputation</div>
-                            <div class="rep-content">
-                                <div class="rep-gauge-wrap"><div class="rep-gauge" id="repGauge"><div class="rep-gauge-arc" id="repGaugeArc"></div><div class="rep-gauge-value" id="repGaugeValue">--</div></div></div>
-                                <div class="rep-info"><div class="rep-domain" id="repDomain"></div><div class="rep-verdict" id="repVerdict"></div><div class="rep-badge" id="repBadge"></div></div>
-                            </div>
-                        </div>
-                        <div class="sender-dna-panel" id="senderDnaPanel" style="display:none;">
-                            <div class="dna-header"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a10 10 0 0 1 10 10 10 10 0 0 1-10 10A10 10 0 0 1 2 12 10 10 0 0 1 12 2z"/><path d="M12 8v4l3 3"/></svg><span>Sender DNA</span><span class="dna-badge" id="dnaBadge"></span></div>
-                            <div class="dna-content" id="dnaContent"><div class="dna-status" id="dnaStatus"></div><div class="dna-flags" id="dnaFlags"></div><div class="dna-details" id="dnaDetails"></div></div>
-                        </div>
-                        <div class="header-viewer" id="headerViewer" style="display:none;">
-                            <button class="header-toggle" id="headerToggle"><svg class="header-chevron" id="headerChevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>Email Authentication</button>
-                            <div class="header-details" id="headerDetails" style="display:none;"><div class="header-row" id="headerSPF"><span class="header-label">SPF</span><span class="header-value" id="headerSPFVal"></span></div><div class="header-row" id="headerDKIM"><span class="header-label">DKIM</span><span class="header-value" id="headerDKIMVal"></span></div><div class="header-row" id="headerDMARC"><span class="header-label">DMARC</span><span class="header-value" id="headerDMARCVal"></span></div></div>
-                        </div>
-
-                        <!-- Inline Scan Results — unified assessment, rendered by
-                             renderAssessment(): verdict header + 3 expandable
-                             dimension cards (Content / Links / Sender) + actions. -->
-                        <div class="scan-results" id="scanResults" style="display:none;">
-                            <div class="assess" id="assessRoot"></div>
-                        </div>
 
                         <!-- Email actions: always visible at the bottom of any email
                              preview, regardless of scan state or verdict. -->
@@ -596,6 +578,17 @@
                 <div class="settings-section">
                     <label class="settings-label">Font Size: <span id="fontSizeVal">11</span>px</label>
                     <input type="range" class="font-slider" id="fontSlider" min="9" max="18" value="11" step="1">
+                </div>
+
+                <div class="settings-section settings-row">
+                    <label class="settings-label">Compact email list</label>
+                    <label class="toggle-switch" id="densityToggleWrap" title="Compact rows">
+                        <input type="checkbox" id="densityToggle">
+                        <span class="toggle-slider">
+                            <span class="toggle-icon toggle-icon-sun"></span>
+                            <span class="toggle-icon toggle-icon-moon"></span>
+                        </span>
+                    </label>
                 </div>
 
             </div>

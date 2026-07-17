@@ -24,11 +24,12 @@ const state = {
     emails: [],
     selectedIdx: null,           // display-only array index into state.emails
     scanResults: {},             // keyed by email.id (message id) — NOT by array index
-    stats: { scanned: 0, threats: 0, safe: 0 },
+    stats: { scanned: 0, threats: 0, safe: 0, dangerous: 0, suspicious: 0, safeTier: 0 },
     navView: 'inbox',
     theme: 'cupertino',
     mode: 'dark',
     fontSize: 11,
+    compactList: false,
     inlineVisible: false,
     detailReportOpen: false,
     /* Starred emails are now stored in Supabase (starred_emails table)
@@ -39,6 +40,12 @@ const state = {
     /* Saved Outlook accounts (names + emails, NO tokens) — also synced
        from Supabase (user_accounts) on sign-in. */
     savedAccounts: [],
+    detectionRules: {
+        brand_name_tokens: {},
+        brand_domains: [],
+        risky_tlds: [],
+        trusted_domains: [],
+    },
     user: null,                  // current Supabase user (set by onChange)
     supabaseJwt: null,           // forwarded to Flask so it can call Supabase as the user
     /* Stash for provider tokens returned by the Supabase PKCE code exchange.
@@ -370,6 +377,22 @@ function domainMatches(domain, allowedDomains) {
     });
 }
 
+async function loadDetectionRules() {
+    try {
+        const res = await fetch('/api/detection-rules', { credentials: 'same-origin' });
+        if (!res.ok) return;
+        const rules = await res.json();
+        state.detectionRules = {
+            brand_name_tokens: rules.brand_name_tokens || {},
+            brand_domains: Array.isArray(rules.brand_domains) ? rules.brand_domains : [],
+            risky_tlds: Array.isArray(rules.risky_tlds) ? rules.risky_tlds : [],
+            trusted_domains: Array.isArray(rules.trusted_domains) ? rules.trusted_domains : [],
+        };
+    } catch (e) {
+        console.warn('[PhishGuard] detection rules not loaded:', e);
+    }
+}
+
 /* Convert a URL into a visually defanged form so it cannot be copy-pasted
    and accidentally clicked downstream. http(s):// → hxxp(s)://, every dot
    becomes [.], and @ becomes [@]. The original URL stays in data-url so
@@ -550,6 +573,7 @@ async function scanEmail(idx) {
             setStatus('Scan failed: ' + data.error, 'error');
             return;
         }
+        if (!data.scanned_at) data.scanned_at = new Date().toISOString();
         state.scanResults[messageId] = data;
 
         const isPhishing = data.prediction === 1;
@@ -601,6 +625,7 @@ async function scanAll() {
                                         { method: 'POST' });
             const data = await res.json();
             if (!data.error) {
+                if (!data.scanned_at) data.scanned_at = new Date().toISOString();
                 state.scanResults[messageId] = data;
             }
         } catch (e) { /* skip failed */ }
@@ -661,21 +686,85 @@ function updateStatsFromResults() {
 }
 
 function renderStats() {
-    document.getElementById('statScannedNum').textContent = state.stats.scanned;
-    document.getElementById('statThreatsNum').textContent = state.stats.threats;
-    document.getElementById('statSafeNum').textContent = state.stats.safe;
+    const setTxt = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
+    setTxt('statScannedNum', state.stats.scanned);
+    setTxt('statThreatsNum', state.stats.threats);
+    setTxt('statSafeNum', state.stats.safe);
 
-    document.getElementById('dashScanned').textContent = state.stats.scanned;
-    document.getElementById('dashThreats').textContent = state.stats.threats;
-    document.getElementById('dashSafe').textContent = state.stats.safe;
+    setTxt('dashScanned', state.stats.scanned);
+    setTxt('dashThreats', state.stats.threats);
+    setTxt('dashSafe', state.stats.safe);
 
     // Sidebar Scan Summary
-    const setTxt = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
     setTxt('sumDangerous', state.stats.dangerous || 0);
     setTxt('sumSuspicious', state.stats.suspicious || 0);
     setTxt('sumSafe', state.stats.safeTier || 0);
 
+    updateDashboardInsights();
     updateSecurityScore();
+}
+
+function updateDashboardInsights() {
+    const wrap = document.getElementById('dashInsights');
+    if (!wrap) return;
+    const scanned = state.stats.scanned || 0;
+    if (!scanned) {
+        wrap.style.display = 'none';
+        return;
+    }
+    wrap.style.display = '';
+
+    const dangerous = state.stats.dangerous || 0;
+    const suspicious = state.stats.suspicious || 0;
+    const safe = state.stats.safeTier || 0;
+    const pct = (n) => Math.max(0, Math.min(100, Math.round((n / scanned) * 100))) + '%';
+    const setWidth = (id, value) => {
+        const el = document.getElementById(id);
+        if (el) el.style.width = value;
+    };
+    const setTxt = (id, value) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = value;
+    };
+    setWidth('dashBarDanger', pct(dangerous));
+    setWidth('dashBarWarn', pct(suspicious));
+    setWidth('dashBarSafe', pct(safe));
+    setTxt('dashLegDanger', dangerous);
+    setTxt('dashLegWarn', suspicious);
+    setTxt('dashLegSafe', safe);
+
+    const threatCounts = {};
+    let lastScan = null;
+    for (let i = 0; i < state.emails.length; i++) {
+        const result = scanResultFor(i);
+        if (!result) continue;
+        const tsRaw = result.scanned_at || result.scannedAt || result.timestamp;
+        const ts = tsRaw ? new Date(tsRaw) : null;
+        if (ts && !isNaN(ts.getTime()) && (!lastScan || ts > lastScan)) lastScan = ts;
+        const threats = (result.assessment && result.assessment.threats) || [];
+        for (const t of threats) {
+            const title = (t && t.title) ? String(t.title) : '';
+            if (!title) continue;
+            threatCounts[title] = (threatCounts[title] || 0) + 1;
+        }
+    }
+
+    const list = document.getElementById('dashThreatsList');
+    if (list) {
+        const top = Object.entries(threatCounts)
+            .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+            .slice(0, 3);
+        list.innerHTML = top.length
+            ? top.map(([name, count]) => '<div class="dash-threat-row"><span>' + escapeHtml(name) + '</span><b>' + count + '</b></div>').join('')
+            : '<div class="dash-empty-note">No recurring threat patterns yet.</div>';
+    }
+
+    const last = document.getElementById('dashLastScan');
+    if (last) {
+        last.textContent = lastScan
+            ? 'Last scan ' + lastScan.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+            : 'Last scan just now';
+    }
 }
 
 /* ======================== #10 INBOX SECURITY SCORE ======================== */
@@ -687,7 +776,7 @@ function updateSecurityScore() {
     const wrap = document.getElementById('securityScoreWrap');
     if (!wrap) return;
 
-    /* Only show after scan-all (all emails scanned) */
+    /* Only show once every visible email has a scan result. */
     if (total === 0 || scanned < total) {
         wrap.style.display = 'none';
         return;
@@ -838,14 +927,20 @@ function isPriorityWarn(email) {
     const subject = (email.subject || '').toLowerCase();
     const sender = (email.sender || '').toLowerCase();
     const hasUrgency = URGENCY_WORDS.some(w => subject.includes(w));
-    const suspiciousTlds = ['.xyz', '.top', '.click', '.buzz', '.net'];
+    const configuredTlds = state.detectionRules.risky_tlds || [];
+    const suspiciousTlds = configuredTlds.length
+        ? configuredTlds.map(t => t.charAt(0) === '.' ? t : '.' + t)
+        : ['.xyz', '.top', '.click', '.buzz', '.net'];
     const hasSuspiciousTld = suspiciousTlds.some(t => sender.endsWith(t));
     const domain = extractDomain(sender);
-    const hasMismatch = /paypal|microsoft|apple|amazon|chase|google/.test(sender) &&
-        !domainMatches(domain, [
-            'paypal.com', 'microsoft.com', 'apple.com',
-            'amazon.com', 'chase.com', 'google.com',
-        ]);
+    const brandTokens = state.detectionRules.brand_name_tokens || {};
+    const fallbackBrands = {
+        paypal: 'paypal.com', microsoft: 'microsoft.com', apple: 'apple.com',
+        amazon: 'amazon.com', chase: 'chase.com', google: 'google.com',
+    };
+    const brands = Object.keys(brandTokens).length ? brandTokens : fallbackBrands;
+    const hasMismatch = Object.entries(brands).some(([token, expected]) =>
+        sender.includes(token) && !domainMatches(domain, [expected]));
 
     return (authFailed && (hasUrgency || hasSuspiciousTld)) || hasMismatch;
 }
@@ -1158,9 +1253,7 @@ function showEmail(idx) {
     // Hide elements on email switch
     document.getElementById('replyWarning').style.display = 'none';
     document.getElementById('mismatchAlert').style.display = 'none';
-    document.getElementById('trustScoreBadge').style.display = 'none';
     document.getElementById('scanBrief').style.display = 'none';
-    document.getElementById('detailReportToggleWrap').style.display = 'none';
 
     renderAttachments(email);
     // Attachment metadata isn't in the email-list fetch — pull it lazily the
@@ -1216,8 +1309,6 @@ function showEmail(idx) {
     }
 
     const scanBtn = document.getElementById('scanBtn');
-    const scanResults = document.getElementById('scanResults');
-    scanResults.style.display = 'none';
     state.inlineVisible = false;
     state.detailReportOpen = false;
 
@@ -1451,8 +1542,6 @@ function showScanBrief(idx) {
     const _sb = document.getElementById('scanBtn');
     _sb.style.display = '';
     _sb.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg> Rescan';
-    const drt = document.getElementById('detailReportToggleWrap');
-    if (drt) drt.style.display = 'none';
 }
 
 function showScanResults(idx) {
@@ -1677,22 +1766,24 @@ function checkContactMismatch(email) {
     const addr = (email.sender || '').toLowerCase();
     const domain = addr.split('@')[1] || '';
 
-    // Known brand names and their real domains
-    const brands = {
-        'microsoft': ['microsoft.com', 'outlook.com', 'live.com', 'hotmail.com'],
-        'apple': ['apple.com', 'icloud.com', 'me.com'],
-        'google': ['google.com', 'gmail.com', 'youtube.com'],
-        'amazon': ['amazon.com', 'amazon.co.uk', 'amazonaws.com'],
-        'paypal': ['paypal.com'],
-        'chase': ['chase.com', 'jpmorgan.com'],
-        'bank of america': ['bankofamerica.com', 'bofa.com'],
-        'wells fargo': ['wellsfargo.com'],
-        'netflix': ['netflix.com'],
-        'facebook': ['facebook.com', 'meta.com', 'fb.com'],
-        'instagram': ['instagram.com'],
-        'linkedin': ['linkedin.com'],
-        'twitter': ['twitter.com', 'x.com'],
-    };
+    const configuredBrands = state.detectionRules.brand_name_tokens || {};
+    const brands = Object.keys(configuredBrands).length
+        ? Object.fromEntries(Object.entries(configuredBrands).map(([brand, domain]) => [brand, [domain]]))
+        : {
+            'microsoft': ['microsoft.com', 'outlook.com', 'live.com', 'hotmail.com'],
+            'apple': ['apple.com', 'icloud.com', 'me.com'],
+            'google': ['google.com', 'gmail.com', 'youtube.com'],
+            'amazon': ['amazon.com', 'amazon.co.uk', 'amazonaws.com'],
+            'paypal': ['paypal.com'],
+            'chase': ['chase.com', 'jpmorgan.com'],
+            'bank of america': ['bankofamerica.com', 'bofa.com'],
+            'wells fargo': ['wellsfargo.com'],
+            'netflix': ['netflix.com'],
+            'facebook': ['facebook.com', 'meta.com', 'fb.com'],
+            'instagram': ['instagram.com'],
+            'linkedin': ['linkedin.com'],
+            'twitter': ['twitter.com', 'x.com'],
+        };
 
     let mismatch = false;
     let brandName = '';
@@ -1757,10 +1848,19 @@ function setFontSize(size) {
     document.getElementById('fontSlider').value = size;
 }
 
+function setListDensity(compact) {
+    state.compactList = !!compact;
+    document.documentElement.classList.toggle('compact-list', state.compactList);
+    localStorage.setItem('pg-compactList', state.compactList ? '1' : '0');
+    const densityToggle = document.getElementById('densityToggle');
+    if (densityToggle) densityToggle.checked = state.compactList;
+}
+
 function loadPreferences() {
     const savedTheme = localStorage.getItem('pg-theme');
     const savedMode = localStorage.getItem('pg-mode');
     const savedFontSize = localStorage.getItem('pg-fontSize');
+    const savedCompactList = localStorage.getItem('pg-compactList');
 
     // 'indigo' is the default (no override → mode-block accents). Older saved
     // values like 'cupertino' simply fall through to the default palette.
@@ -1771,6 +1871,8 @@ function loadPreferences() {
 
     if (savedFontSize) setFontSize(parseInt(savedFontSize, 10));
     else setFontSize(11);
+
+    setListDensity(savedCompactList === '1');
 }
 
 /* ======================== SETTINGS MODAL ======================== */
@@ -1790,6 +1892,11 @@ function closeSettings() {
    loaded into state.savedAccounts on Supabase sign-in and cleared on
    sign-out. The localStorage `pg-accounts` key is no longer used. */
 
+function setReconnectBannerVisible(visible) {
+    const banner = document.getElementById('reconnectBanner');
+    if (banner) banner.style.display = visible ? 'flex' : 'none';
+}
+
 async function checkAuthStatus() {
     try {
         const r = await fetch('/api/auth/status');
@@ -1802,9 +1909,11 @@ async function checkAuthStatus() {
         // Reveal the "Connect Outlook" recovery button whenever we have
         // a Supabase session but Flask says no Outlook is connected.
         const reconnectBtn = document.getElementById('pgReconnectBtn');
+        const needsReconnect = Boolean(state.user && !data.connected);
         if (reconnectBtn) {
-            reconnectBtn.style.display = (state.user && !data.connected) ? 'inline-flex' : 'none';
+            reconnectBtn.style.display = needsReconnect ? 'inline-flex' : 'none';
         }
+        setReconnectBannerVisible(needsReconnect);
 
         if (data.connected) {
             connectBtn.style.display = 'none';   // legacy button, always hidden
@@ -2189,6 +2298,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch (e) { /* non-electron context */ }
     // Fetch the CSRF token before any mutation runs.
     await ensureCsrfToken();
+    await loadDetectionRules();
     loadEmails();
 
     /* Search */
@@ -2227,42 +2337,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         refreshOutlookEmails();
     });
 
-    /* Rescan (= scan all) */
-    document.getElementById('scanAllBtn').addEventListener('click', () => {
-        scanAll();
-    });
-
     /* Live scan toggle — auto-scan on open. Persisted. */
 
     /* Scan / Hide toggle */
     document.getElementById('scanBtn').addEventListener('click', () => {
         if (state.selectedIdx === null) return;
         scanEmail(state.selectedIdx);
-    });
-
-    /* View Detailed Security Report toggle */
-    document.getElementById('detailReportBtn').addEventListener('click', () => {
-        if (state.selectedIdx === null) return;
-        const scanResults = document.getElementById('scanResults');
-        const btn = document.getElementById('detailReportBtn');
-
-        if (state.detailReportOpen) {
-            // Hide detailed report
-            scanResults.style.display = 'none';
-            state.detailReportOpen = false;
-            state.inlineVisible = false;
-            btn.textContent = 'View Detailed Security Report';
-        } else {
-            // Show detailed report — populate if needed
-            const result = scanResultFor(state.selectedIdx);
-            if (result) {
-                renderAssessment(result);
-            }
-            scanResults.style.display = 'block';
-            state.detailReportOpen = true;
-            state.inlineVisible = true;
-            btn.textContent = 'Hide Detailed Security Report';
-        }
     });
 
     /* Header toggle */
@@ -2309,15 +2389,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (state.selectedIdx === null) return;
         const email = state.emails[state.selectedIdx];
         if (email) showContactCard(email, document.getElementById('previewSender'));
-    });
-
-    /* Header toggle */
-    document.getElementById('headerToggle').addEventListener('click', () => {
-        const details = document.getElementById('headerDetails');
-        const chevron = document.getElementById('headerChevron');
-        const isOpen = details.style.display !== 'none';
-        details.style.display = isOpen ? 'none' : 'block';
-        chevron.classList.toggle('open', !isOpen);
     });
 
     /* Link preview on hover.
@@ -2375,7 +2446,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         let host = '';
         try { host = new URL(url.indexOf('://') >= 0 ? url : 'http://' + url).hostname.toLowerCase(); } catch (e) {}
         const tld = host.indexOf('.') >= 0 ? host.split('.').pop() : '';
-        const RISKY_TLD = {test:1,tk:1,ml:1,ga:1,cf:1,gq:1,xyz:1,top:1,click:1,zip:1,mov:1,buzz:1,work:1,country:1,link:1,review:1,loan:1,men:1,date:1,fit:1,rest:1};
+        const configuredTlds = state.detectionRules.risky_tlds || [];
+        const RISKY_TLD = configuredTlds.length
+            ? Object.fromEntries(configuredTlds.map(t => [String(t).replace(/^\./, ''), 1]))
+            : {test:1,tk:1,ml:1,ga:1,cf:1,gq:1,xyz:1,top:1,click:1,zip:1,mov:1,buzz:1,work:1,country:1,link:1,review:1,loan:1,men:1,date:1,fit:1,rest:1};
         if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return { scored:false, level:'high', reason:'Uses a raw IP address instead of a domain name.' };
         if (url.indexOf('@') >= 0) return { scored:false, level:'high', reason:"Contains an '@' that hides the link's true destination." };
         if (host.indexOf('xn--') >= 0) return { scored:false, level:'high', reason:'Punycode — a possible look-alike of a real domain.' };
@@ -2518,6 +2592,28 @@ document.addEventListener('DOMContentLoaded', async () => {
         setFontSize(parseInt(e.target.value, 10));
     });
 
+    const densityToggle = document.getElementById('densityToggle');
+    if (densityToggle) {
+        densityToggle.addEventListener('change', (e) => {
+            setListDensity(e.target.checked);
+        });
+    }
+
+    const reconnectBannerBtn = document.getElementById('reconnectBannerBtn');
+    if (reconnectBannerBtn) {
+        reconnectBannerBtn.addEventListener('click', () => {
+            const statusReconnect = document.getElementById('pgReconnectBtn');
+            if (statusReconnect && statusReconnect.offsetParent !== null) {
+                statusReconnect.click();
+            } else {
+                startExternalMicrosoftSignIn(null).catch(e => {
+                    console.error('[PhishGuard] reconnect threw:', e);
+                    setStatus('Reconnect failed - see console', 'error');
+                });
+            }
+        });
+    }
+
     /* Connect button in topbar — opens modal or disconnects */
     document.getElementById('connectBtn').addEventListener('click', handleConnectClick);
 
@@ -2625,8 +2721,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             scanEmail(state.selectedIdx);
         } else if (key === 'r') {
             document.getElementById('refreshBtn').click();
-        } else if (key === 'a') {
-            scanAll();
         } else if (key === 'f' && state.selectedIdx !== null) {
             toggleStar(state.selectedIdx);
         } else if (key === 'j' && state.selectedIdx !== null) {
@@ -2777,12 +2871,13 @@ function initSupabaseAuth() {
             state.starredEmails = {};
             state.savedAccounts = [];
             state.scanResults = {};
-            state.stats = { scanned: 0, threats: 0, safe: 0 };
+            state.stats = { scanned: 0, threats: 0, safe: 0, dangerous: 0, suspicious: 0, safeTier: 0 };
             try { localStorage.removeItem('pg-provider'); } catch (e) {} // legacy cleanup
             renderStats();
             renderEmailList();
             renderPopupAccounts('');
             hideSignedInIndicator();
+            setReconnectBannerVisible(false);
             showModal();
         }
     });
@@ -3141,13 +3236,14 @@ function signOutOfPhishGuard() {
     state.starredEmails = {};
     state.savedAccounts = [];
     state.scanResults = {};
-    state.stats = { scanned: 0, threats: 0, safe: 0 };
+    state.stats = { scanned: 0, threats: 0, safe: 0, dangerous: 0, suspicious: 0, safeTier: 0 };
     state.emails = [];
     state.pendingProviderToken = null;
     // Clear the idempotency guard so the next sign-in's handler runs
     // even if it's the same user_id as before.
     state._lastSignInUserId = null;
     state._lastSignInAt = 0;
+    setReconnectBannerVisible(false);
 
     // 2. Clear localStorage entries: legacy pg-provider plus every
     //    Supabase auth-token key (`sb-<projectRef>-auth-token`). Doing
@@ -3252,6 +3348,7 @@ async function loadScanHistoryFromSupabase() {
                 prediction: row.prediction,
                 confidence: row.confidence,
                 risk_score: riskScore,
+                scanned_at: row.scanned_at || null,
                 assessment: assessment,
                 url_analysis: null,
                 header_result: sigs.header_result || null,
