@@ -20,9 +20,9 @@ from functools import wraps
 from html.parser import HTMLParser
 from pathlib import Path
 import tempfile as _tempfile
-from urllib.parse import urlencode, urlparse, urlsplit, unquote
+from urllib.parse import urlparse, urlsplit, unquote
 
-from flask import Flask, Response, jsonify, redirect, request, send_from_directory, session
+from flask import Flask, Response, jsonify, request, send_from_directory
 
 from phishing_detector import OnnxClassifier, PhishingDetector
 
@@ -74,10 +74,6 @@ ALLOWED_ORIGINS = frozenset({
 CSRF_HEADER = "X-CSRF-Token"
 LAUNCH_HEADER = "X-Launch-Secret"
 LAUNCH_SECRET = os.environ.get("PHISHGUARD_LAUNCH_SECRET", "")
-_UUID_RE = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
-)
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}\.?$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\.?$")
 
 
@@ -113,10 +109,6 @@ def _resolve_user_data_dir():
     emergency = Path(_tempfile.mkdtemp(prefix="phishguard-"))
     print(f"WARNING: Falling back to emergency data dir {emergency}")
     return emergency
-
-
-def _is_uuid(value):
-    return bool(isinstance(value, str) and _UUID_RE.fullmatch(value.strip()))
 
 
 def _is_public_domain(value):
@@ -670,28 +662,64 @@ _FREEMAIL_DOMAINS = frozenset({
     "gmx.net", "fastmail.com", "tutanota.com",
 })
 
-# Cache for WHOIS / DNS lookups (domain -> result dict)
+# Cache for RDAP / DNS lookups.
 _domain_rep_cache = {}
 _domain_rep_cache_lock = threading.Lock()
+_domain_age_cache = {}  # registrable domain -> {"days": int|None, "at": datetime}
+_domain_age_lock = threading.Lock()
+_DOMAIN_AGE_OK_TTL = 7 * 24 * 3600
+_DOMAIN_AGE_FAIL_TTL = 3600
 
 
 def _get_domain_age(domain):
-    """Try to get domain age in days via python-whois. Returns None if unavailable."""
+    """Return domain age in days via RDAP, or None if unavailable.
+
+    RDAP is HTTPS JSON and avoids the optional WHOIS dependency. The
+    lookup is best-effort; failures briefly cache as None so scans keep moving.
+    """
+    reg = _reg_domain(domain)
+    if not reg or "." not in reg or not http_requests:
+        return None
+
+    now = datetime.now()
+    with _domain_age_lock:
+        cached = _domain_age_cache.get(reg)
+        if cached:
+            ttl = _DOMAIN_AGE_OK_TTL if cached["days"] is not None else _DOMAIN_AGE_FAIL_TTL
+            if (now - cached["at"]).total_seconds() < ttl:
+                return cached["days"]
+
+    days = None
     try:
-        import whois
-        from datetime import datetime, timezone
-        w = whois.whois(domain)
-        created = w.creation_date
-        if isinstance(created, list):
-            created = created[0]
-        if created:
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=timezone.utc)
-            age = (datetime.now(timezone.utc) - created).days
-            return max(0, age)
+        from datetime import timezone
+        resp = http_requests.get(
+            "https://rdap.org/domain/" + reg,
+            timeout=HTTP_TIMEOUT,
+            headers={"User-Agent": "PhishGuard/2.0"},
+        )
+        if resp.status_code == 200:
+            for event in (resp.json().get("events") or []):
+                action = str(event.get("eventAction", "")).lower()
+                if action not in ("registration", "registered"):
+                    continue
+                raw = str(event.get("eventDate", "")).strip()
+                if not raw:
+                    break
+                timestamp = raw.replace("Z", "+00:00")
+                try:
+                    created = datetime.fromisoformat(timestamp)
+                except Exception:
+                    created = datetime.fromisoformat(timestamp[:19] + "+00:00")
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                days = max(0, (datetime.now(timezone.utc) - created).days)
+                break
     except Exception:
-        pass
-    return None
+        days = None
+
+    with _domain_age_lock:
+        _domain_age_cache[reg] = {"days": days, "at": now}
+    return days
 
 
 def _check_dns(domain):
@@ -1540,7 +1568,7 @@ def _check_domain_reputation(domain):
     Uses multiple heuristics without requiring API keys:
       - Trusted domain list match
       - TLD risk analysis
-      - Domain age via WHOIS (if available)
+    - Domain age via RDAP (if available)
       - Structural analysis (impersonation patterns)
       - DNS existence check
     Results are cached to avoid repeated lookups.
@@ -1610,7 +1638,7 @@ def _check_domain_reputation(domain):
             signals.append(("impersonation", f"Contains '{brand}' but isn't the real domain"))
             break
 
-    # 4. Domain age via WHOIS
+    # 4. Domain age via RDAP
     domain_age_days = _get_domain_age(domain)
     if domain_age_days is not None:
         if domain_age_days < 30:
@@ -1705,6 +1733,70 @@ def _community_check(domain):
     }
 
 
+# OpenPhish community feed: free active-phishing URL list, fetched in bulk.
+# Matching is exact-URL only and happens locally, so individual email links are
+# never submitted to OpenPhish. Host-level matching would be too broad because
+# phishing pages are often hosted on shared legitimate infrastructure.
+OPENPHISH_FEED_URL = "https://openphish.com/feed.txt"
+OPENPHISH_CACHE_TTL_SECONDS = 6 * 3600
+OPENPHISH_RETRY_SECONDS = 600
+_openphish_lock = threading.Lock()
+_openphish = {"urls": frozenset(), "fetched_at": None, "ok": False}
+
+
+def _openphish_urls():
+    """Return cached OpenPhish URLs, refreshing when stale. Best-effort."""
+    if not http_requests:
+        return _openphish["urls"]
+
+    with _openphish_lock:
+        now = datetime.now()
+        last = _openphish["fetched_at"]
+        ttl = OPENPHISH_CACHE_TTL_SECONDS if _openphish["ok"] else OPENPHISH_RETRY_SECONDS
+        if last and (now - last).total_seconds() < ttl:
+            return _openphish["urls"]
+
+        _openphish["fetched_at"] = now
+        try:
+            resp = http_requests.get(OPENPHISH_FEED_URL, timeout=HTTP_TIMEOUT)
+            if resp.status_code == 200 and resp.text:
+                urls = frozenset(
+                    line.strip()
+                    for line in resp.text.splitlines()
+                    if line.strip().startswith("http")
+                )
+                if urls:
+                    _openphish["urls"] = urls
+                    _openphish["ok"] = True
+                    print(f"OpenPhish feed refreshed: {len(urls)} active URLs")
+                else:
+                    _openphish["ok"] = False
+            else:
+                _openphish["ok"] = False
+        except Exception as exc:
+            _openphish["ok"] = False
+            print(
+                f"OpenPhish feed refresh failed ({exc}); "
+                f"using {len(_openphish['urls'])} cached URLs"
+            )
+        return _openphish["urls"]
+
+
+def _check_openphish(url):
+    """Return True if the exact URL appears in the active OpenPhish feed."""
+    feed = _openphish_urls()
+    if not feed:
+        return None
+    candidate = (url or "").strip()
+    if not candidate:
+        return None
+    return (
+        candidate in feed
+        or candidate.rstrip("/") in feed
+        or (candidate + "/") in feed
+    )
+
+
 def _sender_domain_from_email(email):
     sender = ""
     sender_from = email.get("from", {})
@@ -1756,6 +1848,18 @@ def run_threat_intel(email, urls_in_email=None):
                 results["confirmed_phishing"] = True
                 results["signals"].append(
                     f"Google Safe Browsing: a link is flagged as {threat_type} ({url})"
+                )
+
+            # OpenPhish exact-URL hit. The feed is downloaded in bulk and
+            # matched locally, so this check does not submit user links.
+            if url not in results["url_threats"] and _check_openphish(url) is True:
+                results["url_threats"][url] = {
+                    "malicious": True,
+                    "sources": ["OpenPhish"],
+                }
+                results["confirmed_phishing"] = True
+                results["signals"].append(
+                    f"OpenPhish: a link is on the active phishing feed ({url})"
                 )
 
             existing = results["url_threats"].get(url)
@@ -2163,29 +2267,13 @@ def report_sender():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Microsoft Graph API Client (OAuth2 Auth Code + PKCE)
+#  Microsoft Graph API Client
 # ─────────────────────────────────────────────────────────────────────────────
-AUTHORITY = "https://login.microsoftonline.com/common"
 GRAPH_URL = "https://graph.microsoft.com/v1.0"
-SCOPES = ["Mail.Read", "User.Read"]
-REDIRECT_URI = "http://localhost:5050/auth/callback"
-
-# Pending OAuth requests are process-wide because the Microsoft callback popup
-# may not carry the renderer's session cookie. Each entry stores the sid that
-# initiated the flow so the callback can populate the correct SessionState.
-_pending_oauth = {}  # state -> {client_id, verifier, expires, sid}
-_OAUTH_TIMEOUT = timedelta(minutes=10)  # pending auth requests expire after 10 min
 
 _external_oauth_lock = threading.Lock()
 _external_oauth_pending = {}
 _EXTERNAL_OAUTH_TTL_SECONDS = 600
-
-
-def _generate_pkce():
-    verifier = secrets.token_urlsafe(64)[:128]
-    digest = hashlib.sha256(verifier.encode("ascii")).digest()
-    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-    return verifier, challenge
 
 
 def _graph_request(sess, endpoint, params=None):
@@ -2287,48 +2375,10 @@ def auth_status():
     })
 
 
-@app.route("/api/auth/connect", methods=["POST"])
-@require_csrf
-def auth_connect():
-    """Start OAuth flow — returns the Microsoft login URL."""
-    sess = _current_session()
-    if http_requests is None:
-        return jsonify({"error": "requests library not installed"}), 500
-
-    data = request.get_json(silent=True) or {}
-    client_id = data.get("client_id", "").strip()
-    if not _is_uuid(client_id):
-        return jsonify({"error": "Client ID must be a UUID"}), 400
-
-    # Store client_id and PKCE server-side (not in session — popup may lose cookie)
-    verifier, challenge = _generate_pkce()
-    state = secrets.token_urlsafe(32)
-
-    # Clean up expired pending requests
-    now = datetime.now()
-    expired = [k for k, v in _pending_oauth.items() if now >= v["expires"]]
-    for k in expired:
-        del _pending_oauth[k]
-
-    _pending_oauth[state] = {
-        "client_id": client_id,
-        "verifier": verifier,
-        "expires": now + _OAUTH_TIMEOUT,
-        "sid": sess.sid,
-    }
-
-    params = {
-        "client_id": client_id,
-        "response_type": "code",
-        "redirect_uri": REDIRECT_URI,
-        "scope": " ".join(SCOPES),
-        "response_mode": "query",
-        "state": state,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-    }
-    auth_url = f"{AUTHORITY}/oauth2/v2.0/authorize?{urlencode(params)}"
-    return jsonify({"auth_url": auth_url})
+# Legacy direct-Microsoft OAuth routes (/api/auth/connect + /auth/callback)
+# are intentionally removed. Microsoft sign-in is Supabase-brokered via the
+# external-browser flow below, so the backend no longer depends on a fixed
+# http://localhost:5050/auth/callback redirect URI.
 
 
 @app.route("/api/auth/external-start", methods=["POST"])
@@ -2574,112 +2624,6 @@ def auth_supabase_provider():
     })
 
 
-@app.route("/auth/callback")
-def auth_callback():
-    """Handle Microsoft OAuth redirect callback."""
-    error = request.args.get("error")
-    if error:
-        desc = request.args.get("error_description", error)
-        return f"""<html><body style="font-family:system-ui;text-align:center;padding:60px">
-        <h2>Sign-in Failed</h2><p>{html.escape(str(desc))}</p>
-        <p>You can close this tab.</p></body></html>"""
-
-    received_state = request.args.get("state")
-    pending = _pending_oauth.pop(received_state, None)
-    if not pending or datetime.now() >= pending["expires"]:
-        return f"""<html><body style="font-family:system-ui;text-align:center;padding:60px">
-        <h2>Error</h2><p>Invalid or expired state parameter.</p>
-        <p>You can close this tab.</p></body></html>"""
-
-    with _sessions_lock:
-        sess = _sessions.get(pending.get("sid"))
-    if not sess:
-        return f"""<html><body style="font-family:system-ui;text-align:center;padding:60px">
-        <h2>Error</h2><p>The original PhishGuard session expired.</p>
-        <p>You can close this tab and try signing in again.</p></body></html>"""
-
-    code = request.args.get("code")
-    if not code:
-        return f"""<html><body style="font-family:system-ui;text-align:center;padding:60px">
-        <h2>Error</h2><p>No authorization code received.</p>
-        <p>You can close this tab.</p></body></html>"""
-
-    # Exchange code for token
-    client_id = pending["client_id"]
-    verifier = pending["verifier"]
-    token_url = f"{AUTHORITY}/oauth2/v2.0/token"
-    token_data = {
-        "client_id": client_id,
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": REDIRECT_URI,
-        "code_verifier": verifier,
-        "scope": " ".join(SCOPES),
-    }
-
-    try:
-        r = http_requests.post(token_url, data=token_data)
-        if r.status_code != 200:
-            err = r.json()
-            desc = err.get("error_description", err.get("error", "Token exchange failed"))
-            short = desc.split("\r\n")[0] if "\r\n" in desc else desc
-            return f"""<html><body style="font-family:system-ui;text-align:center;padding:60px">
-            <h2>Sign-in Failed</h2><p>{html.escape(str(short))}</p>
-            <p>You can close this tab.</p></body></html>"""
-
-        tokens = r.json()
-        access_token = tokens.get("access_token")
-        expires_in = int(tokens.get("expires_in", 3600))
-
-        # Temporarily set token so _graph_request works, then load mail before
-        # marking this session connected.
-        sess.graph_token["access_token"] = access_token
-        sess.graph_token["expiry"] = datetime.now() + timedelta(seconds=expires_in)
-
-        # Get user info
-        try:
-            user_info = _graph_request(sess, "me")
-            sess.graph_user["name"] = user_info.get("displayName", "User")
-            sess.graph_user["email"] = user_info.get("mail") or user_info.get("userPrincipalName", "")
-        except Exception:
-            sess.graph_user["name"] = "Connected"
-            sess.graph_user["email"] = ""
-
-        # Fetch emails before marking live mode — prevents race where
-        # the main window poll sees "connected" but emails aren't loaded yet
-        try:
-            sess.live_emails = _fetch_all_emails(sess)
-            sess.junk_emails = _fetch_junk_emails(sess)
-        except Exception as e:
-            sess.live_emails = []
-            sess.junk_emails = []
-
-        # Now mark live — the poll will see "connected" and loadEmails()
-        # will return the real emails
-        sess.live_mode = True
-
-        # Clear any previous scan results
-        sess.scan_results.clear()
-
-        # Log the login
-        _log_session_event("LOGIN", {
-            "User": sess.graph_user["name"],
-            "Email": sess.graph_user["email"],
-            "Emails Loaded": len(sess.live_emails),
-        })
-
-    except Exception as e:
-        return f"""<html><body style="font-family:system-ui;text-align:center;padding:60px">
-        <h2>Error</h2><p>{html.escape(str(e))}</p>
-        <p>You can close this tab.</p></body></html>"""
-
-    return f"""<html><body style="font-family:system-ui;text-align:center;padding:60px">
-    <h2>Connected to Outlook</h2>
-    <p>Signed in as {sess.graph_user['name'] or 'User'}</p>
-    <p>You can close this tab and return to PhishGuard.</p>
-    <script>window.close();</script></body></html>"""
-
-
 @app.route("/api/auth/disconnect", methods=["POST"])
 @require_csrf
 def auth_disconnect():
@@ -2708,9 +2652,6 @@ def auth_disconnect():
     sess.junk_emails = []
     sess.live_mode = False
     sess.scan_results.clear()
-    for state, pending in list(_pending_oauth.items()):
-        if pending.get("sid") == sess.sid:
-            _pending_oauth.pop(state, None)
     return jsonify({"ok": True})
 
 
@@ -3415,6 +3356,8 @@ def _score_link(url, url_threats, analyzer):
         checks.append({"src": "VirusTotal", "result": url_feed["vt"]})
     if any("URLhaus" in s for s in sources):
         checks.append({"src": "URLhaus", "result": "flagged"})
+    if any("OpenPhish" in s for s in sources):
+        checks.append({"src": "OpenPhish", "result": "flagged"})
 
     def result(score, msg, decided_by):
         score = int(max(0, min(100, score)))
