@@ -1,4 +1,9 @@
-# Python environments
+# Track only the PHISHGUARD project from the repository root.
+/*
+!/PHISHGUARD/
+!/.gitignore
+
+# Python environments and caches
 .venv/
 venv/
 __pycache__/
@@ -13,31 +18,23 @@ __MACOSX/
 .idea/
 .vscode/
 
-# Packaged exports and large archives
+# Packaged exports, logs, and build output
 *.zip
 *.7z
 *.rar
 *.tar
 *.tar.gz
 *.log
+node_modules/
+dist/
+build/
 
 # Environment secrets
 .env
 .env.*
 !.env.example
 
-# JavaScript dependencies/build outputs
-node_modules/
-dist/
-build/
-final(supabase_test_updated)/
-
 # PhishGuard local runtime state
 PHISHGUARD/phishguard_log.txt
 PHISHGUARD/sender_dna.json
 PHISHGUARD/local_scan_history.json
-final-bigmodeltest
-bigmodel
-!PHISHGUARD/bigmodel/
-!PHISHGUARD/bigmodel/**
-final-bigmodeltest\final-bigmodeltest
