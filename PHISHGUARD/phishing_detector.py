@@ -9,41 +9,65 @@ The legacy scikit-learn pickle model was removed from the runtime. Training
 for the current models lives in bigmodel/.
 """
 
+import hashlib
+import hmac
+import json
+import os
 import re
 from urllib.parse import urlparse
 
 import numpy as np
 
 
+def load_detection_rules():
+    """Load config/detection_rules.json with built-in fallbacks elsewhere.
+
+    Rules are configuration, not code. If the JSON is absent or malformed,
+    callers continue using their local defaults so detection stays enabled.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "config", "detection_rules.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            rules = json.load(f)
+        return rules if isinstance(rules, dict) else {}
+    except Exception as exc:
+        print(f"detection_rules.json not loaded ({exc}); using built-in lists.")
+        return {}
+
+
+_DETECTION_RULES = load_detection_rules()
+
+
 class URLAnalyzer:
     """Analyzes URLs for phishing indicators."""
 
     # Suspicious TLDs often used in phishing
-    SUSPICIOUS_TLDS = {
+    SUSPICIOUS_TLDS = set(_DETECTION_RULES.get("url_suspicious_tlds") or {
         '.xyz', '.top', '.club', '.work', '.click', '.link', '.gq', '.ml',
         '.cf', '.tk', '.ga', '.pw', '.cc', '.buzz', '.info', '.biz', '.ru'
-    }
+    })
 
     # Known URL shorteners
-    URL_SHORTENERS = {
+    URL_SHORTENERS = set(_DETECTION_RULES.get("url_shorteners") or {
         'bit.ly', 'tinyurl.com', 'goo.gl', 't.co', 'ow.ly', 'is.gd',
         'buff.ly', 'adf.ly', 'bit.do', 'mcaf.ee', 'su.pr', 'shorte.st'
-    }
+    })
 
     # Brands commonly impersonated in phishing
-    IMPERSONATED_BRANDS = {
+    IMPERSONATED_BRANDS = set(_DETECTION_RULES.get("url_impersonated_brands") or {
         'paypal', 'apple', 'amazon', 'microsoft', 'google', 'netflix',
         'facebook', 'instagram', 'whatsapp', 'linkedin', 'twitter',
         'chase', 'wellsfargo', 'bankofamerica', 'citibank', 'usbank',
         'dropbox', 'docusign', 'adobe', 'office365', 'outlook', 'icloud'
-    }
+    })
 
     # Suspicious keywords in URLs
-    SUSPICIOUS_KEYWORDS = {
+    SUSPICIOUS_KEYWORDS = set(_DETECTION_RULES.get("url_suspicious_keywords") or {
         'login', 'signin', 'verify', 'secure', 'account', 'update',
         'confirm', 'password', 'credential', 'authenticate', 'suspend',
         'locked', 'urgent', 'expire', 'billing', 'payment', 'wallet'
-    }
+    })
 
     # URL pattern to extract URLs from text. Bounded character class and
     # explicit length limit keep this linear-time even on adversarial bodies.
@@ -465,6 +489,7 @@ class OnnxClassifier:
                 print(f"OnnxClassifier: model files not found in {self.model_dir}; falling back.")
                 return False
             meta_path = os.path.join(self.model_dir, "phishguard_metadata.json")
+            meta = {}
             if os.path.exists(meta_path):
                 with open(meta_path) as f:
                     meta = json.load(f)
@@ -473,6 +498,25 @@ class OnnxClassifier:
                 for k, v in (meta.get("labels") or {}).items():
                     if str(v).upper().startswith("PHISH"):
                         self.phishing_index = int(k)
+            expected_hashes = meta.get("model_sha256") or {}
+            if expected_hashes:
+                base = os.path.basename(onnx_path)
+                expected = expected_hashes.get(base)
+                if not expected:
+                    print(f"OnnxClassifier: {base} has no expected hash in "
+                          "phishguard_metadata.json; refusing to load it.")
+                    return False
+                digest = hashlib.sha256()
+                with open(onnx_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        digest.update(chunk)
+                if not hmac.compare_digest(digest.hexdigest().lower(), str(expected).lower()):
+                    print(f"OnnxClassifier: SHA-256 mismatch for {base} "
+                          "(possible tamper/corruption); refusing to load.")
+                    return False
+            else:
+                print("OnnxClassifier: no model_sha256 in metadata - "
+                      "loading unverified (re-export to add hashes).")
             self._np = np
             self.tokenizer = Tokenizer.from_file(tok_path)
             self.tokenizer.enable_truncation(max_length=self.max_length)

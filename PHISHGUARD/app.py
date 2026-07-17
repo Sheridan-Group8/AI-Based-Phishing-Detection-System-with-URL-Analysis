@@ -24,7 +24,7 @@ from urllib.parse import urlparse, urlsplit, unquote
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 
-from phishing_detector import OnnxClassifier, PhishingDetector
+from phishing_detector import OnnxClassifier, PhishingDetector, load_detection_rules
 
 try:
     import requests as http_requests
@@ -58,6 +58,7 @@ _load_dotenv()
 HTTP_TIMEOUT = (5, 15)
 _MAX_BODY_FOR_REGEX = 200_000
 _MAX_URLS_PER_EMAIL = 100
+_DETECTION_RULES = load_detection_rules()
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Flask App
@@ -654,6 +655,10 @@ _SUSPICIOUS_TLDS = frozenset({
     ".ga", ".pw", ".work", ".party", ".date", ".trade", ".webcam",
     ".science", ".accountant", ".cricket", ".faith", ".zip", ".mov",
 })
+_SUSPICIOUS_TLDS = frozenset(
+    t if str(t).startswith(".") else "." + str(t)
+    for t in (_DETECTION_RULES.get("risky_tlds") or _SUSPICIOUS_TLDS)
+)
 
 _FREEMAIL_DOMAINS = frozenset({
     "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
@@ -1630,8 +1635,10 @@ def _check_domain_reputation(domain):
         signals.append(("long_name", "Unusually long domain name"))
 
     # Brand impersonation patterns
-    _brands = ["paypal", "apple", "google", "microsoft", "amazon", "chase",
-               "wellsfargo", "bankofamerica", "netflix", "facebook", "instagram"]
+    _brands = list(_BRAND_NAME_TOKENS.keys()) or [
+        "paypal", "apple", "google", "microsoft", "amazon", "chase",
+        "wellsfargo", "bankofamerica", "netflix", "facebook", "instagram",
+    ]
     for brand in _brands:
         if brand in name_part and domain not in _TRUSTED_DOMAINS:
             score -= 0.25
@@ -2157,6 +2164,19 @@ def get_csrf_token():
     """Compatibility token for the Electron renderer's secure fetch wrapper."""
     sess = _current_session()
     return jsonify({"csrf": sess.csrf_token, "launchSecret": bool(LAUNCH_SECRET)})
+
+
+@app.route("/api/detection-rules", methods=["GET"])
+def get_detection_rules():
+    """Expose non-secret detection config needed by the renderer."""
+    return jsonify({
+        "trusted_domains": sorted(
+            _DETECTION_RULES.get("trusted_domains")
+            or ["company.com", "amazon.com", "chase.com", "atlassian.net"]),
+        "brand_name_tokens": _DETECTION_RULES.get("brand_name_tokens") or _BRAND_NAME_TOKENS,
+        "brand_domains": sorted(_DETECTION_RULES.get("brand_domains") or _BRAND_DOMAINS),
+        "risky_tlds": sorted(_DETECTION_RULES.get("risky_tlds") or _RISKY_TLDS),
+    })
 
 
 @app.route("/api/settings", methods=["GET"])
@@ -3222,6 +3242,7 @@ _RISKY_TLDS = {
     "rest", "country", "kim", "loan", "men", "review", "date", "racing",
     "stream", "download", "win", "bid", "trade",
 }
+_RISKY_TLDS = set(_DETECTION_RULES.get("risky_tlds") or _RISKY_TLDS)
 _CRED_LURE = (
     "verify your", "confirm your", "confirm that you", "log in", "login",
     "sign in", "signin", "update your password", "reset your password",
@@ -3230,6 +3251,7 @@ _CRED_LURE = (
     "account has been", "account is", "suspend", "deactivat", "reactivat",
     "still use this account", "secure your account", "billing portal",
 )
+_CRED_LURE = tuple(_DETECTION_RULES.get("cred_lure_phrases") or _CRED_LURE)
 _BRAND_DOMAINS = {
     "paypal.com", "microsoft.com", "apple.com", "amazon.com", "google.com",
     "netflix.com", "facebook.com", "instagram.com", "linkedin.com",
@@ -3238,7 +3260,66 @@ _BRAND_DOMAINS = {
     "docusign.com", "dropbox.com", "adobe.com", "coinbase.com",
     "outlook.com", "office.com", "icloud.com",
 }
+_BRAND_DOMAINS = set(_DETECTION_RULES.get("brand_domains") or _BRAND_DOMAINS)
+_BRAND_NAME_TOKENS = {
+    "paypal": "paypal.com", "microsoft": "microsoft.com",
+    "office 365": "office.com", "office365": "office.com",
+    "microsoft 365": "microsoft.com", "apple": "apple.com",
+    "amazon": "amazon.com", "google": "google.com",
+    "netflix": "netflix.com", "facebook": "facebook.com",
+    "instagram": "instagram.com", "linkedin": "linkedin.com",
+    "chase": "chase.com", "wells fargo": "wellsfargo.com",
+    "bank of america": "bankofamerica.com",
+    "american express": "americanexpress.com", "amex": "americanexpress.com",
+    "dhl": "dhl.com", "fedex": "fedex.com",
+    "docusign": "docusign.com", "dropbox": "dropbox.com",
+    "adobe": "adobe.com", "coinbase": "coinbase.com",
+}
+_BRAND_NAME_TOKENS = dict(_DETECTION_RULES.get("brand_name_tokens") or _BRAND_NAME_TOKENS)
 URL_MODEL_SOLO_CAP = 45
+
+
+class _AnchorPairExtractor(HTMLParser):
+    """Collect visible link text and href pairs from HTML email bodies."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.pairs = []
+        self._href = None
+        self._buf = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "a":
+            return
+        if self._href is not None:
+            self._flush()
+        href = ""
+        for name, value in attrs:
+            if name.lower() == "href" and value:
+                href = value.strip()
+        self._href = href
+        self._buf = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._buf.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "a" and self._href is not None:
+            self._flush()
+
+    def _flush(self):
+        text = "".join(self._buf).strip()
+        if self._href:
+            self.pairs.append((text, self._href))
+        self._href, self._buf = None, []
+
+
+_DISPLAYED_DOMAIN_RE = re.compile(
+    r'^\s*(?:https?://)?(?:www\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)', re.I)
+_HOMOGLYPH_MAP = str.maketrans({
+    "0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "6": "b",
+    "7": "t", "8": "b", "9": "g", "$": "s", "|": "l",
+})
 
 
 def _risk_level(score):
@@ -3281,6 +3362,83 @@ def _reg_domain(value):
     return ".".join(parts[-2:]) if len(parts) >= 2 else value
 
 
+def _anchor_text_mismatch_urls(raw_html):
+    """Return href URLs whose visible text displays a different untrusted site."""
+    out = set()
+    if not raw_html or "<a" not in raw_html.lower():
+        return out
+    try:
+        parser = _AnchorPairExtractor()
+        parser.feed(raw_html)
+    except Exception:
+        return out
+    for text, href in parser.pairs:
+        if not href.lower().startswith(("http://", "https://")):
+            continue
+        match = _DISPLAYED_DOMAIN_RE.match(text or "")
+        if not match:
+            continue
+        shown_reg = _reg_domain(match.group(1))
+        if not shown_reg or "." not in shown_reg:
+            continue
+        try:
+            href_host = (urlparse(href).hostname or "").lower()
+        except Exception:
+            continue
+        if href_host and shown_reg != _reg_domain(href_host) and _link_domain_untrusted(href_host):
+            out.add(href)
+    return out
+
+
+def _deglyph(value):
+    return (value or "").lower().translate(_HOMOGLYPH_MAP).replace("rn", "m").replace("vv", "w")
+
+
+def _edit_distance(a, b, cap=2):
+    la, lb = len(a), len(b)
+    if abs(la - lb) > cap:
+        return cap + 1
+    prev2 = None
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        cur = [i] + [0] * lb
+        best = cur[0]
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            val = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if (prev2 is not None and i > 1 and j > 1
+                    and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]):
+                val = min(val, prev2[j - 2] + 1)
+            cur[j] = val
+            best = min(best, val)
+        if best > cap:
+            return cap + 1
+        prev2, prev = prev, cur
+    return prev[lb]
+
+
+def _lookalike_brand(domain):
+    """Return the known brand domain mimicked by an untrusted look-alike."""
+    domain = _reg_domain(domain)
+    if not domain or "." not in domain:
+        return None
+    if not _link_domain_untrusted(domain) or domain in _BRAND_DOMAINS:
+        return None
+    core = domain.split(".", 1)[0]
+    deglyph_core = _deglyph(core)
+    for brand_domain in _BRAND_DOMAINS:
+        brand_core = brand_domain.split(".", 1)[0]
+        if deglyph_core == brand_core and core != brand_core:
+            return brand_domain
+        if brand_core in deglyph_core and deglyph_core != brand_core:
+            parts = [p for p in re.split(r"[^a-z0-9]+", deglyph_core) if p]
+            if brand_core in parts or deglyph_core.startswith(brand_core) or deglyph_core.endswith(brand_core):
+                return brand_domain
+        if len(brand_core) >= 6 and _edit_distance(deglyph_core, brand_core, cap=1) <= 1:
+            return brand_domain
+    return None
+
+
 def _hdr_dict(headers):
     out = {}
     if isinstance(headers, list):
@@ -3293,7 +3451,7 @@ def _hdr_dict(headers):
     return out
 
 
-def _score_link(url, url_threats, analyzer):
+def _score_link(url, url_threats, analyzer, is_deceptive=False):
     try:
         host = (urlparse(url if "://" in url else "http://" + url).hostname or "").lower()
     except Exception:
@@ -3374,6 +3532,21 @@ def _score_link(url, url_threats, analyzer):
     if feed_malicious:
         srcs = "/".join(dict.fromkeys(sources)) or "threat feed"
         return result(100, "Confirmed malicious - listed on " + srcs + ".", "threat_db")
+    if is_deceptive:
+        checks.append({"src": "Deceptive link", "result": "malicious"})
+        return result(
+            88,
+            "The link's visible text shows a different website than where it actually leads - a hallmark of phishing.",
+            "link_text_mismatch",
+        )
+    lookalike = _lookalike_brand(host)
+    if lookalike:
+        checks.append({"src": "Look-alike of " + lookalike, "result": "malicious"})
+        return result(
+            88,
+            "Link domain '" + host + "' is a look-alike of " + lookalike + " - likely brand impersonation.",
+            "lookalike_domain",
+        )
     if trusted:
         return result(5, reason, "trusted_domain")
 
@@ -3406,12 +3579,14 @@ def _score_link(url, url_threats, analyzer):
     return result(score, reason, decided)
 
 
-def _assess_links(urls, url_threats, analyzer):
+def _assess_links(urls, url_threats, analyzer, deceptive_urls=None):
     if not urls:
         return {"score": 0, "level": "low", "summary": "No links in this message.", "links": []}
+    deceptive_urls = set(deceptive_urls or [])
     scored = []
     for url in urls[:_MAX_URLS_PER_EMAIL]:
-        score, reason, factors = _score_link(url, url_threats, analyzer)
+        score, reason, factors = _score_link(
+            url, url_threats, analyzer, is_deceptive=url in deceptive_urls)
         scored.append({"url": url, "score": score, "level": _risk_level(score),
                        "reason": reason, "factors": factors})
     top = max(scored, key=lambda item: item["score"])
@@ -3462,10 +3637,10 @@ def _assess_content(model_score, full_text, struct):
             "summary": findings[0], "findings": findings, "tags": tags}
 
 
-def analyze_email_auth(headers, from_addr, header_result):
+def analyze_email_auth(headers, from_addr, header_result, from_name=""):
     out = {"risk": 0, "signals": [], "positives": [], "tags": [],
            "sender_ip": None, "aligned": None, "reply_to_mismatch": False,
-           "provider_signal": None}
+           "provider_signal": None, "evidence": {}, "impersonated_brand": None}
     header_map = _hdr_dict(headers)
     if not header_map and not header_result:
         return out
@@ -3513,6 +3688,40 @@ def analyze_email_auth(headers, from_addr, header_result):
         out["risk"] = max(out["risk"], 45)
         out["tags"].append("reply_to_mismatch")
         out["signals"].append(f"Replies go to a different domain ('{reply_to}') than the sender.")
+        out["evidence"]["reply_to_mismatch"] = (
+            f"A reply would go to '{reply_to}', not the sender's domain '{from_dom}'.")
+
+    name_l = (from_name or "").lower()
+    for token, brand_domain in _BRAND_NAME_TOKENS.items():
+        if token in name_l:
+            if (from_dom != brand_domain and not from_dom.endswith("." + brand_domain)
+                    and _link_domain_untrusted(from_dom or "")):
+                strong = dmarc != "pass"
+                out["risk"] = max(out["risk"], 80 if strong else 65)
+                if "display_name_spoof" not in out["tags"]:
+                    out["tags"].append("display_name_spoof")
+                out["signals"].append(
+                    "The display name claims to be " + token.title()
+                    + ", but the sender domain is '" + (from_dom or "unknown")
+                    + "', not " + brand_domain + ".")
+                out["evidence"]["display_name_spoof"] = (
+                    "The display name says '" + token.title() + "', but the address is '"
+                    + (from_dom or "unknown") + "' - not " + brand_domain + ".")
+                out["impersonated_brand"] = token.title()
+            break
+
+    lookalike = _lookalike_brand(from_dom)
+    if lookalike:
+        out["risk"] = max(out["risk"], 85)
+        if "lookalike_domain" not in out["tags"]:
+            out["tags"].append("lookalike_domain")
+        out["signals"].append(
+            "Sender domain '" + from_dom + "' is a look-alike of "
+            + lookalike + " - likely impersonation.")
+        out["evidence"]["lookalike_domain"] = (
+            "The sender domain '" + from_dom + "' is a near-copy of "
+            + lookalike + ".")
+        out["impersonated_brand"] = lookalike.split(".")[0].title()
 
     forefront = header_map.get("x-forefront-antispam-report", "")
     compauth = grab(r"compauth=(\w+)")
@@ -3558,7 +3767,7 @@ def analyze_email_auth(headers, from_addr, header_result):
     return out
 
 
-def _assess_auth(header_result, headers=None, from_addr=""):
+def _assess_auth(header_result, headers=None, from_addr="", from_name=""):
     score, findings, tags = 0, [], []
     header_result = header_result or {}
 
@@ -3577,7 +3786,7 @@ def _assess_auth(header_result, headers=None, from_addr=""):
     else:
         findings.append("SPF/DKIM/DMARC passed.")
 
-    auth = analyze_email_auth(headers, from_addr, header_result)
+    auth = analyze_email_auth(headers, from_addr, header_result, from_name)
     score = max(score, auth["risk"])
     findings.extend(auth["signals"])
     for tag in auth["tags"]:
@@ -3591,7 +3800,9 @@ def _assess_auth(header_result, headers=None, from_addr=""):
             "detail": {"aligned": auth["aligned"],
                        "reply_to_mismatch": auth["reply_to_mismatch"],
                        "provider_signal": auth["provider_signal"],
-                       "sender_ip": auth["sender_ip"]}}
+                       "sender_ip": auth["sender_ip"],
+                       "evidence": auth.get("evidence") or {},
+                       "impersonated_brand": auth.get("impersonated_brand")}}
 
 
 def _assess_sender(threat_intel):
@@ -3673,11 +3884,12 @@ def _assess_attachments(attachments):
 
 def _compute_assessment(model_score, full_text, urls, url_threats,
                         header_result, threat_intel, struct,
-                        headers=None, from_addr="", attachments=None):
+                        headers=None, from_addr="", attachments=None,
+                        from_name="", deceptive_links=None):
     content = _assess_content(model_score, full_text, struct)
-    links = _assess_links(urls, url_threats, detector.url_analyzer)
+    links = _assess_links(urls, url_threats, detector.url_analyzer, deceptive_links)
     sender = _assess_sender(threat_intel)
-    auth = _assess_auth(header_result, headers, from_addr)
+    auth = _assess_auth(header_result, headers, from_addr, from_name)
     files = _assess_attachments(attachments)
     dimensions = [content, links, sender, auth, files]
     scores = [dim["score"] for dim in dimensions]
@@ -3745,6 +3957,13 @@ def _compute_assessment(model_score, full_text, urls, url_threats,
                             "desc": "The sender domain is unfamiliar or has a low reputation."})
     if auth["score"] >= concern:
         tags = auth.get("tags", [])
+        evidence = ((auth.get("detail") or {}).get("evidence") or {})
+        if "lookalike_domain" in tags:
+            threats.append({"title": "Look-Alike Sender Domain", "severity": "high",
+                            "desc": evidence.get("lookalike_domain") or "The sender domain is a near-identical look-alike of a trusted brand."})
+        if "display_name_spoof" in tags:
+            threats.append({"title": "Display Name Spoofing", "severity": "high",
+                            "desc": evidence.get("display_name_spoof") or "The display name impersonates a brand the sender domain does not belong to."})
         if "domain_spoof" in tags:
             threats.append({"title": "Domain Spoofing", "severity": "high",
                             "desc": "The visible sender does not align with the authenticated sending domain."})
@@ -3865,6 +4084,7 @@ def _scan_email_common(sess, email, idx):
     url_pattern = re.compile(r'https?://[^\s<>"\'`]{1,2048}')
     text_urls = url_pattern.findall(scan_body)
     href_urls = _extract_html_link_urls(body)
+    deceptive_links = _anchor_text_mismatch_urls(body)
     seen_urls, urls_found = set(), []
     for url in text_urls + href_urls:
         if url not in seen_urls:
@@ -3885,10 +4105,14 @@ def _scan_email_common(sess, email, idx):
         return None, (jsonify({"error": str(e)}), 500)
 
     sender = email.get("from", {})
+    from_name = ""
     if isinstance(sender, dict):
-        from_addr = (sender.get("emailAddress", {}) or {}).get("address", "") or sender.get("address", "")
+        email_address = sender.get("emailAddress", {}) or {}
+        from_addr = email_address.get("address", "") or sender.get("address", "")
+        from_name = email_address.get("name", "") or sender.get("name", "")
     else:
         from_addr = email.get("sender", "") if isinstance(email.get("sender"), str) else ""
+        from_name = email.get("sender_name", "") if isinstance(email.get("sender_name"), str) else ""
 
     message_id = _message_key(email, idx)
     attachments = _load_attachment_metadata(sess, message_id, email)
@@ -3904,6 +4128,8 @@ def _scan_email_common(sess, email, idx):
         headers=email.get("internetMessageHeaders"),
         from_addr=from_addr,
         attachments=attachments,
+        from_name=from_name,
+        deceptive_links=deceptive_links,
     )
 
     prediction = int(assessment["verdict"])
