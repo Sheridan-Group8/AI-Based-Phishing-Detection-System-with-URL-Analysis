@@ -1,0 +1,10 @@
+# PhishGuard Python runtime dependencies.
+# The app no longer uses the legacy scikit-learn pickle model, so packages such
+# as scikit-learn, pandas, joblib, torch, and transformers are not required.
+
+Flask>=3.0,<4
+requests>=2.31,<3
+
+numpy>=1.26.4,<3
+onnxruntime>=1.24.1,<2
+tokenizers>=0.20,<1

@@ -1,0 +1,26 @@
+{
+  "base_model": "trained from prep_data.py",
+  "max_length": 512,
+  "threshold": 0.92,
+  "labels": {
+    "0": "SAFE",
+    "1": "PHISHING"
+  },
+  "runtime": "onnxruntime",
+  "model_sha256": {
+    "model.onnx": "9e61b8db388909939adf6b0ced9ace1586bb2268c7282d7fb780f97d663c724b",
+    "model_quantized.onnx": "e1bf81036406760927db7eb6b4703d09257f371999259a39611fdac5d240574a"
+  },
+  "threshold_calibration": {
+    "method": "held-out ONNX threshold sweep",
+    "date": "2026-07-17",
+    "eval_file": "data/url_eval.parquet",
+    "precision_target": 0.98,
+    "selected_policy": "maximize recall subject to precision >= 0.98",
+    "precision": 1.0,
+    "recall": 0.0002382654276864427,
+    "false_positives": 0,
+    "false_negatives": 8392,
+    "warning": "Precision target is met only at near-zero recall; keep URL model capped as a corroborating signal until retrained."
+  }
+}

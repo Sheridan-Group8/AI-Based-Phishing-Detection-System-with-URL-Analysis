@@ -1,0 +1,42 @@
+# Track only the PHISHGUARD project from the repository root.
+/*
+!/PHISHGUARD/
+!/.gitignore
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local/editor files
+.DS_Store
+Thumbs.db
+__MACOSX/
+._*
+.idea/
+.vscode/
+
+# Packaged exports, logs, and build output
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.log
+node_modules/
+dist/
+build/
+PHISHGUARD/backend-build/
+PHISHGUARD/backend-dist/
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# PhishGuard local runtime state
+PHISHGUARD/phishguard_log.txt
+PHISHGUARD/sender_dna.json
+PHISHGUARD/local_scan_history.json

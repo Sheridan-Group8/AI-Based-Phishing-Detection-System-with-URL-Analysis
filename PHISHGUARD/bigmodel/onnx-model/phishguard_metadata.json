@@ -1,0 +1,25 @@
+{
+  "base_model": "trained from prep_data.py",
+  "max_length": 512,
+  "threshold": 0.89,
+  "labels": {
+    "0": "SAFE",
+    "1": "PHISHING"
+  },
+  "runtime": "onnxruntime",
+  "model_sha256": {
+    "model.onnx": "96d195e2835df27cc9a6d97ffc52d96f50ae04d74b1119a4dc2cbf4107f7fee4",
+    "model_quantized.onnx": "06064f56bf5ae9f62bee7b5c54baffbae1f9fbc2c6dcca12e354611b6397df1e"
+  },
+  "threshold_calibration": {
+    "method": "held-out ONNX threshold sweep",
+    "date": "2026-07-17",
+    "eval_file": "data/eval.parquet",
+    "precision_target": 0.98,
+    "selected_policy": "maximize recall subject to precision >= 0.98",
+    "precision": 0.9851301115241635,
+    "recall": 0.7133243606998654,
+    "false_positives": 8,
+    "false_negatives": 213
+  }
+}

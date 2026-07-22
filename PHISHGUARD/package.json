@@ -1,0 +1,53 @@
+{
+  "name": "phishguard",
+  "version": "2.0.0",
+  "description": "PhishGuard — AI-powered phishing email detection",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build:backend": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-backend.ps1",
+    "build:electron": "electron-builder",
+    "build": "npm run build:backend && electron-builder",
+    "build:win": "npm run build:backend && electron-builder --win",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux"
+  },
+  "build": {
+    "appId": "com.phishguard.app",
+    "productName": "PhishGuard",
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "backend-dist/phishguard-backend",
+        "to": "backend"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": null,
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "PhishGuard"
+    },
+    "mac": {
+      "target": "dmg"
+    },
+    "linux": {
+      "target": "AppImage"
+    }
+  },
+  "devDependencies": {
+    "electron": "^41.7.1",
+    "electron-builder": "^26.9.0"
+  }
+}
