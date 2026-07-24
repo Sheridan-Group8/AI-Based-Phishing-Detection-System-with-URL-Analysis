@@ -1364,7 +1364,7 @@ function renderAttachments(email) {
                     + 'unknown</span>'
                     + '<button class="vt-deepscan" data-att="' + escapeHtml(name)
                     + '" title="Upload this file to VirusTotal for a fresh scan. Sends the file&#39;s contents to VirusTotal.">Deep scan</button>';
-            } else if (vt.configured === false) {
+            } else if (vt.configured === false || vt.enabled === false) {
                 vtBadge = '<span class="vt-status vt-disabled" title="' + escapeHtml(vt.message || '') + '">'
                     + 'VT off</span>';
             } else if (vt.error) {
@@ -1394,6 +1394,12 @@ function renderAttachments(email) {
 async function deepScanAttachment(email, name) {
     const messageId = email.id || email.messageId;
     if (!messageId) return;
+    const confirmed = window.confirm(
+        'Upload “' + name + '” to VirusTotal?\n\n'
+        + 'The complete attachment will leave this device and be handled under '
+        + 'VirusTotal’s privacy and retention policies.'
+    );
+    if (!confirmed) return;
     const att = (email.attachments || []).find(
         a => (typeof a === 'string' ? a : (a.name || a.filename)) === name);
     const attId = (att && typeof att === 'object' && (att.id || att.name)) || name;
@@ -1405,7 +1411,11 @@ async function deepScanAttachment(email, name) {
         + '/attachments/' + encodeURIComponent(attId) + '/deepscan';
     let data;
     try {
-        const res = await apiFetch(base, { method: 'POST' });
+        const res = await apiFetch(base, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ confirm_upload: true }),
+        });
         data = await res.json();
     } catch (e) {
         email._vt_results[name] = { error: 'upload failed' };
@@ -1639,6 +1649,31 @@ function renderAssessment(result, email) {
             (dims.auth ? bar('Auth', dims.auth, 'Whether the email proved who it’s from — SPF/DKIM/DMARC, domain alignment and Reply-To checks.') : '') +
             (dims.files ? bar('Files', dims.files, 'Risk from attachments, judged by file type and VirusTotal verdict.') : '') +
         '</div>';
+    }
+
+    const providerOutcomes = (
+        result.threat_intel && result.threat_intel.provider_outcomes
+    ) || {};
+    const providerOutcomeLabels = {
+        flagged: 'Flagged',
+        not_flagged: 'Not flagged',
+        not_found: 'Not found',
+        not_checked: 'Not checked',
+        provider_unavailable: 'Provider unavailable',
+    };
+    const providerIds = Object.keys(PROVIDER_DISPLAY_NAMES);
+    if (providerIds.some(id => providerOutcomes[id])) {
+        html += '<div class="rail-section"><div class="rail-cap">Remote Provider Checks</div>';
+        for (const id of providerIds) {
+            const item = providerOutcomes[id] || { outcome: 'not_checked' };
+            const outcome = item.outcome || 'not_checked';
+            const title = item.reason ? ' title="' + escapeHtml(item.reason) + '"' : '';
+            html += '<div class="provider-check-row"><span>'
+                + escapeHtml(PROVIDER_DISPLAY_NAMES[id]) + '</span><span class="provider-outcome outcome-'
+                + escapeHtml(outcome) + '"' + title + '>'
+                + escapeHtml(providerOutcomeLabels[outcome] || 'Not checked') + '</span></div>';
+        }
+        html += '</div>';
     }
 
     // Header analysis
@@ -1878,12 +1913,202 @@ function loadPreferences() {
 /* ======================== SETTINGS MODAL ======================== */
 
 function openSettings() {
+    clearProviderKeyInputs();
     document.getElementById('settingsModal').style.display = 'flex';
     checkAuthStatus();
+    refreshProviderSettings();
 }
 
 function closeSettings() {
+    clearProviderKeyInputs();
     document.getElementById('settingsModal').style.display = 'none';
+}
+
+const PROVIDER_DISPLAY_NAMES = {
+    virustotal: 'VirusTotal',
+    google_safe_browsing: 'Google Safe Browsing',
+    urlscan: 'urlscan.io',
+    abuseipdb: 'AbuseIPDB',
+};
+
+function clearProviderKeyInputs() {
+    document.querySelectorAll('[data-provider-key]').forEach(input => {
+        input.value = '';
+    });
+}
+
+function setProviderFeedback(card, message, type) {
+    const element = card && card.querySelector('[data-provider-feedback]');
+    if (!element) return;
+    element.textContent = message || '';
+    element.className = 'provider-feedback'
+        + (type === 'error' ? ' feedback-error' : (type === 'ok' ? ' feedback-ok' : ''));
+}
+
+function providerSettingsBridge() {
+    const bridge = window.electron && window.electron.providerSettings;
+    return bridge && typeof bridge.get === 'function' ? bridge : null;
+}
+
+async function refreshProviderSettings() {
+    const cards = document.querySelectorAll('.provider-card[data-provider]');
+    const notice = document.getElementById('providerStorageNotice');
+    const bridge = providerSettingsBridge();
+    let local = null;
+    let backend = null;
+
+    try {
+        const requests = [apiFetch('/api/settings').then(r => r.json())];
+        if (bridge) requests.push(bridge.get());
+        const values = await Promise.all(requests);
+        backend = values[0];
+        local = values[1] || null;
+    } catch (_error) {
+        if (notice) {
+            notice.textContent = 'Provider settings are temporarily unavailable.';
+            notice.classList.add('storage-warning');
+        }
+        return;
+    }
+
+    const secure = local && local.ok && local.secureStorage;
+    if (notice) {
+        notice.classList.toggle('storage-warning', !secure || !secure.available);
+        if (!bridge) {
+            notice.textContent = 'User API keys can only be managed in the Electron desktop app.';
+        } else if (!secure || !secure.available) {
+            notice.textContent = (secure && secure.reason)
+                ? secure.reason + ' Existing deployer keys can still be enabled or disabled.'
+                : 'Protected credential storage is unavailable. User keys cannot be saved.';
+        } else {
+            notice.textContent = 'User keys are encrypted by the operating system and kept on this device.';
+        }
+    }
+
+    const backendProviders = Object.fromEntries(
+        ((backend && backend.providers) || []).map(item => [item.id, item])
+    );
+    const localProviders = (local && local.ok && local.providers) || {};
+    const statusLabels = {
+        enabled: 'Enabled',
+        disabled: 'Disabled',
+        not_configured: 'Not configured',
+        unavailable: 'Unavailable',
+        rate_limited: 'Rate-limited',
+    };
+
+    cards.forEach(card => {
+        const id = card.dataset.provider;
+        const server = backendProviders[id] || {
+            configured: false,
+            enabled: false,
+            status: 'unavailable',
+            reason: 'No status received',
+            key_source: 'none',
+        };
+        const stored = localProviders[id] || {};
+        const status = card.querySelector('[data-provider-status]');
+        const source = card.querySelector('[data-provider-source]');
+        const toggle = card.querySelector('[data-provider-enabled]');
+        const input = card.querySelector('[data-provider-key]');
+        const save = card.querySelector('[data-provider-save]');
+        const remove = card.querySelector('[data-provider-remove]');
+
+        status.textContent = statusLabels[server.status] || 'Unavailable';
+        status.className = 'provider-status status-' + (server.status || 'unavailable');
+        status.title = server.reason || '';
+        source.textContent = stored.userKeyConfigured
+            ? (stored.userKeyAvailable === false ? 'Stored key unavailable' : 'User key')
+            : (server.key_source === 'deployer' ? 'Deployer key' : '');
+        toggle.checked = Boolean(server.enabled);
+        toggle.disabled = !bridge || !server.configured;
+        input.disabled = !bridge || !secure || !secure.available;
+        save.disabled = input.disabled;
+        input.placeholder = stored.userKeyConfigured
+            ? (stored.userKeyAvailable === false
+                ? 'Stored key unavailable; enter to replace'
+                : '•••••••• (stored; enter to replace)')
+            : (server.key_source === 'deployer'
+                ? '•••••••• (deployer key; enter to override)'
+                : 'Enter API key');
+        remove.hidden = !bridge || !stored.userKeyConfigured;
+        card.dataset.configured = server.configured ? '1' : '0';
+        if (server.reason && server.status !== 'enabled') {
+            setProviderFeedback(card, server.reason, server.status === 'unavailable' ? 'error' : '');
+        } else {
+            setProviderFeedback(card, '', '');
+        }
+    });
+}
+
+async function saveProviderKey(card) {
+    const bridge = providerSettingsBridge();
+    if (!bridge || !card) return;
+    const id = card.dataset.provider;
+    const input = card.querySelector('[data-provider-key]');
+    const key = input.value.trim();
+    input.value = '';
+    if (!key) {
+        setProviderFeedback(card, 'Enter an API key to save.', 'error');
+        return;
+    }
+    setProviderFeedback(card, 'Saving…', '');
+    let response;
+    try {
+        response = await bridge.update(id, { key, enabled: true });
+    } catch (_error) {
+        setProviderFeedback(card, 'Could not save key.', 'error');
+        return;
+    }
+    if (!response || !response.ok) {
+        setProviderFeedback(card, (response && response.reason) || 'Could not save key.', 'error');
+        return;
+    }
+    setProviderFeedback(card, 'Key saved on this device.', 'ok');
+    await new Promise(resolve => setTimeout(resolve, 80));
+    await refreshProviderSettings();
+}
+
+async function toggleProvider(card, enabled) {
+    const bridge = providerSettingsBridge();
+    if (!bridge || !card) return;
+    const toggle = card.querySelector('[data-provider-enabled]');
+    toggle.disabled = true;
+    let response;
+    try {
+        response = await bridge.update(
+            card.dataset.provider,
+            { enabled: Boolean(enabled) }
+        );
+    } catch (_error) {
+        response = null;
+    }
+    if (!response || !response.ok) {
+        setProviderFeedback(card, (response && response.reason) || 'Could not update provider.', 'error');
+    }
+    await new Promise(resolve => setTimeout(resolve, 80));
+    await refreshProviderSettings();
+}
+
+async function removeProviderKey(card) {
+    const bridge = providerSettingsBridge();
+    if (!bridge || !card) return;
+    const name = PROVIDER_DISPLAY_NAMES[card.dataset.provider] || 'provider';
+    if (!window.confirm('Remove your locally stored ' + name + ' key? A deployer key, if present, will be used instead.')) {
+        return;
+    }
+    let response;
+    try {
+        response = await bridge.clearKey(card.dataset.provider);
+    } catch (_error) {
+        response = null;
+    }
+    if (!response || !response.ok) {
+        setProviderFeedback(card, (response && response.reason) || 'Could not remove key.', 'error');
+        return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 80));
+    await refreshProviderSettings();
 }
 
 /* ======================== OUTLOOK CONNECTION ======================== */
@@ -2577,6 +2802,27 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('settingsModal').addEventListener('click', (e) => {
         if (e.target === document.getElementById('settingsModal')) {
             closeSettings();
+        }
+    });
+
+    const providerRefreshBtn = document.getElementById('providerRefreshBtn');
+    if (providerRefreshBtn) {
+        providerRefreshBtn.addEventListener('click', refreshProviderSettings);
+    }
+    document.querySelectorAll('.provider-card[data-provider]').forEach(card => {
+        const save = card.querySelector('[data-provider-save]');
+        const remove = card.querySelector('[data-provider-remove]');
+        const toggle = card.querySelector('[data-provider-enabled]');
+        const input = card.querySelector('[data-provider-key]');
+        if (save) save.addEventListener('click', () => saveProviderKey(card));
+        if (remove) remove.addEventListener('click', () => removeProviderKey(card));
+        if (toggle) {
+            toggle.addEventListener('change', () => toggleProvider(card, toggle.checked));
+        }
+        if (input) {
+            input.addEventListener('keydown', event => {
+                if (event.key === 'Enter') saveProviderKey(card);
+            });
         }
     });
 
