@@ -176,6 +176,13 @@ ABUSEIPDB_KEY=your_key_here
 
 OpenPhish community-feed checks and RDAP domain-age checks do not require an API key.
 
+In the Electron desktop app, users can also open **Settings → Threat
+intelligence providers** to add a local key or independently enable/disable
+configured providers. User keys are encrypted with Electron `safeStorage`,
+remain on the local device, and are never returned by the Flask settings API or
+written to Supabase. Full attachment uploads to VirusTotal still require a
+separate confirmation.
+
 ### 7. Start the App
 
 From the `PHISHGUARD` folder:
