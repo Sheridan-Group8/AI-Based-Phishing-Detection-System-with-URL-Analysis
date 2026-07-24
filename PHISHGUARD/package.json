@@ -18,6 +18,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "provider-settings.js",
       "package.json"
     ],
     "extraResources": [

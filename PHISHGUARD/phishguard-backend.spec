@@ -42,7 +42,10 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,
+    # Electron supplies a private stdin pipe for live provider configuration.
+    # Keep standard streams available; main.js uses windowsHide so this does
+    # not display a console window in the packaged desktop app.
+    console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

@@ -3,6 +3,7 @@
 !/PHISHGUARD/
 !/.gitignore
 
+
 # Python environments and caches
 .venv/
 venv/

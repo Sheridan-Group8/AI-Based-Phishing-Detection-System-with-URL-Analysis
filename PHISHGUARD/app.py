@@ -746,7 +746,231 @@ def _check_dns(domain):
         return None
 
 
+_PROVIDER_DEFINITIONS = {
+    "virustotal": {
+        "name": "VirusTotal",
+        "privacy": (
+            "Receives extracted URLs and SHA-256 attachment hashes. Attachment "
+            "contents are uploaded only after a separate confirmation."
+        ),
+    },
+    "google_safe_browsing": {
+        "name": "Google Safe Browsing",
+        "privacy": (
+            "Receives 4-byte SHA-256 prefixes derived from URLs in the message; "
+            "PhishGuard does not send the complete URL in this lookup."
+        ),
+    },
+    "urlscan": {
+        "name": "urlscan.io",
+        "privacy": (
+            "Receives sender/link domains for search. Unfamiliar link hosts may "
+            "be submitted as an unlisted URL for a live scan."
+        ),
+    },
+    "abuseipdb": {
+        "name": "AbuseIPDB",
+        "privacy": "Receives the public originating IP address from message headers.",
+    },
+}
+
 VIRUSTOTAL_API_KEY = os.environ.get("VIRUSTOTAL_API_KEY", "").strip()
+GSB_API_KEY = os.environ.get("GOOGLE_SAFE_BROWSING_KEY", "").strip()
+URLSCAN_API_KEY = os.environ.get("URLSCAN_API_KEY", "").strip()
+ABUSEIPDB_API_KEY = os.environ.get("ABUSEIPDB_KEY", "").strip()
+_DEPLOYER_PROVIDER_KEYS = {
+    "virustotal": VIRUSTOTAL_API_KEY,
+    "google_safe_browsing": GSB_API_KEY,
+    "urlscan": URLSCAN_API_KEY,
+    "abuseipdb": ABUSEIPDB_API_KEY,
+}
+_PROVIDER_KEY_SOURCES = {
+    provider_id: ("deployer" if key else "none")
+    for provider_id, key in _DEPLOYER_PROVIDER_KEYS.items()
+}
+_provider_config_lock = threading.RLock()
+_provider_enabled = {provider_id: True for provider_id in _PROVIDER_DEFINITIONS}
+_provider_runtime = {
+    provider_id: {
+        "status": "enabled" if _DEPLOYER_PROVIDER_KEYS[provider_id] else "not_configured",
+        "reason": "",
+        "updated_at": None,
+    }
+    for provider_id in _PROVIDER_DEFINITIONS
+}
+
+
+def _provider_key(provider_id):
+    return {
+        "virustotal": VIRUSTOTAL_API_KEY,
+        "google_safe_browsing": GSB_API_KEY,
+        "urlscan": URLSCAN_API_KEY,
+        "abuseipdb": ABUSEIPDB_API_KEY,
+    }.get(provider_id, "")
+
+
+def _set_provider_key(provider_id, value):
+    global VIRUSTOTAL_API_KEY, GSB_API_KEY, URLSCAN_API_KEY, ABUSEIPDB_API_KEY
+    if provider_id == "virustotal":
+        VIRUSTOTAL_API_KEY = value
+    elif provider_id == "google_safe_browsing":
+        GSB_API_KEY = value
+    elif provider_id == "urlscan":
+        URLSCAN_API_KEY = value
+    elif provider_id == "abuseipdb":
+        ABUSEIPDB_API_KEY = value
+
+
+def _provider_can_run(provider_id):
+    with _provider_config_lock:
+        return bool(
+            _provider_enabled.get(provider_id)
+            and _provider_key(provider_id)
+            and http_requests
+        )
+
+
+def _record_provider_status(provider_id, status, reason=""):
+    if provider_id not in _PROVIDER_DEFINITIONS:
+        return
+    if status not in {"enabled", "unavailable", "rate_limited"}:
+        status = "unavailable"
+    with _provider_config_lock:
+        _provider_runtime[provider_id] = {
+            "status": status,
+            "reason": str(reason or "")[:80],
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+
+def _record_provider_http_status(provider_id, status_code):
+    if status_code in (200, 201, 202, 204):
+        _record_provider_status(provider_id, "enabled")
+    elif status_code == 429:
+        _record_provider_status(provider_id, "rate_limited", "Request quota reached")
+    elif status_code in (401, 403):
+        _record_provider_status(provider_id, "unavailable", "API key rejected or revoked")
+    else:
+        _record_provider_status(provider_id, "unavailable", "Provider request failed")
+
+
+def _provider_public_statuses():
+    statuses = []
+    with _provider_config_lock:
+        for provider_id, definition in _PROVIDER_DEFINITIONS.items():
+            configured = bool(_provider_key(provider_id))
+            enabled = bool(configured and _provider_enabled[provider_id])
+            runtime = dict(_provider_runtime[provider_id])
+            if not configured:
+                status, reason = "not_configured", "No API key is configured"
+            elif not enabled:
+                status, reason = "disabled", "Disabled by the user"
+            elif not http_requests:
+                status, reason = "unavailable", "HTTP client is unavailable"
+            else:
+                status = runtime.get("status") or "enabled"
+                reason = runtime.get("reason") or ""
+                if status == "not_configured":
+                    status = "enabled"
+            statuses.append({
+                "id": provider_id,
+                "name": definition["name"],
+                "configured": configured,
+                "enabled": enabled,
+                "status": status,
+                "reason": reason,
+                "key_source": _PROVIDER_KEY_SOURCES[provider_id],
+                "privacy": definition["privacy"],
+                "updated_at": runtime.get("updated_at"),
+            })
+    return statuses
+
+
+def _clear_provider_cache(provider_id):
+    if provider_id == "virustotal":
+        with _vt_cache_lock:
+            _vt_cache.clear()
+        with _vt_url_cache_lock:
+            _vt_url_cache.clear()
+    elif provider_id == "google_safe_browsing":
+        with _gsb_cache_lock:
+            _gsb_cache.clear()
+    elif provider_id == "urlscan":
+        with _urlscan_cache_lock:
+            _urlscan_cache.clear()
+
+
+def _apply_provider_configuration(message):
+    """Apply a validated command received from Electron's private stdin pipe."""
+    providers = message.get("providers") if isinstance(message, dict) else None
+    if not isinstance(providers, dict):
+        return False
+    changed = []
+    with _provider_config_lock:
+        for provider_id in _PROVIDER_DEFINITIONS:
+            update = providers.get(provider_id)
+            if not isinstance(update, dict):
+                continue
+            old_key = _provider_key(provider_id)
+            old_enabled = _provider_enabled[provider_id]
+            if isinstance(update.get("enabled"), bool):
+                _provider_enabled[provider_id] = update["enabled"]
+            if update.get("use_deployer_key") is True:
+                _set_provider_key(provider_id, _DEPLOYER_PROVIDER_KEYS[provider_id])
+                _PROVIDER_KEY_SOURCES[provider_id] = (
+                    "deployer" if _DEPLOYER_PROVIDER_KEYS[provider_id] else "none"
+                )
+            elif isinstance(update.get("key"), str):
+                key = update["key"].strip()
+                if (
+                    key
+                    and len(key) <= 4096
+                    and all(0x21 <= ord(ch) <= 0x7E for ch in key)
+                ):
+                    _set_provider_key(provider_id, key)
+                    _PROVIDER_KEY_SOURCES[provider_id] = "user"
+            if old_key != _provider_key(provider_id) or old_enabled != _provider_enabled[provider_id]:
+                changed.append(provider_id)
+            configured = bool(_provider_key(provider_id))
+            _provider_runtime[provider_id] = {
+                "status": (
+                    "enabled" if configured and _provider_enabled[provider_id]
+                    else "disabled" if configured
+                    else "not_configured"
+                ),
+                "reason": "",
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+    for provider_id in changed:
+        _clear_provider_cache(provider_id)
+    return True
+
+
+def _provider_control_loop(stream):
+    """Consume secret configuration without echoing commands or parse errors."""
+    for raw_line in stream:
+        if len(raw_line) > 32_768:
+            continue
+        try:
+            message = json.loads(raw_line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(message, dict) and message.get("type") == "provider_config":
+            _apply_provider_configuration(message)
+
+
+def _start_provider_control_channel():
+    if os.environ.get("ELECTRON_MODE") != "1" or not sys.stdin:
+        return
+    thread = threading.Thread(
+        target=_provider_control_loop,
+        args=(sys.stdin,),
+        name="provider-control",
+        daemon=True,
+    )
+    thread.start()
+
+
 VT_API_BASE = "https://www.virustotal.com/api/v3"
 VT_CACHE_TTL_SECONDS = 24 * 3600
 _vt_cache_lock = threading.Lock()
@@ -758,7 +982,6 @@ VT_URL_SUBMIT_POLL = 6
 _vt_url_cache_lock = threading.Lock()
 _vt_url_cache = {}
 
-URLSCAN_API_KEY = os.environ.get("URLSCAN_API_KEY", "").strip()
 URLSCAN_CACHE_TTL_SECONDS = 12 * 3600
 _urlscan_cache_lock = threading.Lock()
 _urlscan_cache = {}
@@ -774,7 +997,7 @@ _community_db_lock = threading.Lock()
 
 def _vt_lookup_hash(sha256):
     """Look up a SHA-256 file hash on VirusTotal without uploading content."""
-    if not VIRUSTOTAL_API_KEY or not http_requests:
+    if not _provider_can_run("virustotal"):
         return None
 
     with _vt_cache_lock:
@@ -793,9 +1016,14 @@ def _vt_lookup_hash(sha256):
             },
             timeout=HTTP_TIMEOUT,
         )
-    except Exception as exc:
-        return {"error": f"network: {exc}", "status": 0}
+    except Exception:
+        _record_provider_status("virustotal", "unavailable", "Network request failed")
+        return {"error": "VirusTotal unavailable", "status": 0}
 
+    if resp.status_code == 404:
+        _record_provider_status("virustotal", "enabled")
+    else:
+        _record_provider_http_status("virustotal", resp.status_code)
     if resp.status_code == 404:
         result = {
             "sha256": sha256,
@@ -824,8 +1052,9 @@ def _vt_lookup_hash(sha256):
                 "first_submission": attrs.get("first_submission_date"),
                 "permalink": f"https://www.virustotal.com/gui/file/{sha256}",
             }
-        except Exception as exc:
-            return {"error": f"parse: {exc}", "status": 200}
+        except Exception:
+            _record_provider_status("virustotal", "unavailable", "Invalid provider response")
+            return {"error": "VirusTotal returned an invalid response", "status": 200}
     elif resp.status_code == 401:
         return {"error": "VT api key invalid or revoked", "status": 401}
     elif resp.status_code == 429:
@@ -844,7 +1073,7 @@ VT_MAX_FILE_BYTES = 32 * 1024 * 1024
 
 def _vt_upload_file(content_bytes, filename="file"):
     """Upload file bytes to VirusTotal for an explicit user-requested scan."""
-    if not VIRUSTOTAL_API_KEY or not http_requests:
+    if not _provider_can_run("virustotal"):
         return None
     if not content_bytes:
         return {"error": "no file bytes", "status": 0}
@@ -863,8 +1092,10 @@ def _vt_upload_file(content_bytes, filename="file"):
             files={"file": (filename or "file", content_bytes)},
             timeout=(5, 60),
         )
-    except Exception as exc:
-        return {"error": f"network: {exc}", "status": 0}
+    except Exception:
+        _record_provider_status("virustotal", "unavailable", "Network request failed")
+        return {"error": "VirusTotal unavailable", "status": 0}
+    _record_provider_http_status("virustotal", resp.status_code)
     if resp.status_code == 401:
         return {"error": "VT api key invalid or revoked", "status": 401}
     if resp.status_code == 429:
@@ -873,8 +1104,9 @@ def _vt_upload_file(content_bytes, filename="file"):
         return {"error": f"http {resp.status_code}", "status": resp.status_code}
     try:
         analysis_id = resp.json().get("data", {}).get("id", "")
-    except Exception as exc:
-        return {"error": f"parse: {exc}", "status": 200}
+    except Exception:
+        _record_provider_status("virustotal", "unavailable", "Invalid provider response")
+        return {"error": "VirusTotal returned an invalid response", "status": 200}
     if not analysis_id:
         return {"error": "no analysis id returned", "status": 200}
     return {"analysis_id": analysis_id}
@@ -882,7 +1114,7 @@ def _vt_upload_file(content_bytes, filename="file"):
 
 def _vt_poll_analysis(analysis_id):
     """Poll a VirusTotal file analysis and return a normalized verdict."""
-    if not VIRUSTOTAL_API_KEY or not http_requests or not analysis_id:
+    if not _provider_can_run("virustotal") or not analysis_id:
         return None
     try:
         resp = http_requests.get(
@@ -893,8 +1125,10 @@ def _vt_poll_analysis(analysis_id):
             },
             timeout=HTTP_TIMEOUT,
         )
-    except Exception as exc:
-        return {"error": f"network: {exc}", "status": 0}
+    except Exception:
+        _record_provider_status("virustotal", "unavailable", "Network request failed")
+        return {"error": "VirusTotal unavailable", "status": 0}
+    _record_provider_http_status("virustotal", resp.status_code)
     if resp.status_code == 429:
         return {"error": "VT rate limit hit; try again in a minute", "status": 429}
     if resp.status_code != 200:
@@ -904,8 +1138,9 @@ def _vt_poll_analysis(analysis_id):
         attrs = payload.get("data", {}).get("attributes", {}) or {}
         status = attrs.get("status", "queued")
         sha = ((payload.get("meta", {}) or {}).get("file_info", {}) or {}).get("sha256", "")
-    except Exception as exc:
-        return {"error": f"parse: {exc}", "status": 200}
+    except Exception:
+        _record_provider_status("virustotal", "unavailable", "Invalid provider response")
+        return {"error": "VirusTotal returned an invalid response", "status": 200}
     if status != "completed":
         return {"status": status}
     stats = attrs.get("stats", {}) or {}
@@ -924,7 +1159,7 @@ def _vt_poll_analysis(analysis_id):
 
 def _check_virustotal_url(url):
     """Look up exact URL reputation on VirusTotal v3."""
-    if not VIRUSTOTAL_API_KEY or not http_requests or not url:
+    if not _provider_can_run("virustotal") or not url:
         return None
     with _vt_url_cache_lock:
         cached = _vt_url_cache.get(url)
@@ -941,9 +1176,14 @@ def _check_virustotal_url(url):
             },
             timeout=HTTP_TIMEOUT,
         )
-    except Exception as exc:
-        return {"error": f"network: {exc}", "status": 0}
+    except Exception:
+        _record_provider_status("virustotal", "unavailable", "Network request failed")
+        return {"error": "VirusTotal unavailable", "status": 0}
 
+    if resp.status_code == 404:
+        _record_provider_status("virustotal", "enabled")
+    else:
+        _record_provider_http_status("virustotal", resp.status_code)
     if resp.status_code == 404:
         result = {"found": False, "malicious": 0, "suspicious": 0, "total": 0}
     elif resp.status_code == 200:
@@ -958,8 +1198,9 @@ def _check_virustotal_url(url):
                 "undetected": int(stats.get("undetected", 0) or 0),
                 "total": int(sum(v or 0 for v in stats.values())),
             }
-        except Exception as exc:
-            return {"error": f"parse: {exc}", "status": 200}
+        except Exception:
+            _record_provider_status("virustotal", "unavailable", "Invalid provider response")
+            return {"error": "VirusTotal returned an invalid response", "status": 200}
     elif resp.status_code in (401, 429):
         return {
             "error": "VT key invalid" if resp.status_code == 401 else "VT rate limit",
@@ -975,7 +1216,7 @@ def _check_virustotal_url(url):
 
 def _vt_submit_url(url):
     """Submit a URL to VirusTotal for a fresh scan."""
-    if not VIRUSTOTAL_API_KEY or not http_requests or not url:
+    if not _provider_can_run("virustotal") or not url:
         return None
     try:
         resp = http_requests.post(
@@ -987,8 +1228,10 @@ def _vt_submit_url(url):
             data={"url": url},
             timeout=(5, 30),
         )
-    except Exception as exc:
-        return {"error": f"network: {exc}", "status": 0}
+    except Exception:
+        _record_provider_status("virustotal", "unavailable", "Network request failed")
+        return {"error": "VirusTotal unavailable", "status": 0}
+    _record_provider_http_status("virustotal", resp.status_code)
     if resp.status_code in (401, 429):
         return {
             "error": "VT key invalid" if resp.status_code == 401 else "VT rate limit",
@@ -998,8 +1241,9 @@ def _vt_submit_url(url):
         return {"error": f"http {resp.status_code}", "status": resp.status_code}
     try:
         analysis_id = resp.json().get("data", {}).get("id", "")
-    except Exception as exc:
-        return {"error": f"parse: {exc}", "status": 200}
+    except Exception:
+        _record_provider_status("virustotal", "unavailable", "Invalid provider response")
+        return {"error": "VirusTotal returned an invalid response", "status": 200}
     return {"analysis_id": analysis_id} if analysis_id else {"error": "no analysis id", "status": 200}
 
 
@@ -1037,7 +1281,7 @@ def _vt_scan_url(url):
 
 def _check_urlscan(domain):
     """Query urlscan.io public search for prior scans of a domain."""
-    if not URLSCAN_API_KEY or not http_requests or not domain:
+    if not _provider_can_run("urlscan") or not domain:
         return None
     key = domain.lower().strip()
     with _urlscan_cache_lock:
@@ -1056,9 +1300,11 @@ def _check_urlscan(domain):
             },
             timeout=HTTP_TIMEOUT,
         )
-    except Exception as exc:
-        return {"error": f"network: {exc}"}
+    except Exception:
+        _record_provider_status("urlscan", "unavailable", "Network request failed")
+        return {"error": "urlscan.io unavailable", "status": 0}
 
+    _record_provider_http_status("urlscan", resp.status_code)
     if resp.status_code == 401:
         return {"error": "urlscan key invalid", "status": 401}
     if resp.status_code == 429:
@@ -1069,6 +1315,7 @@ def _check_urlscan(domain):
     try:
         data = resp.json()
     except ValueError:
+        _record_provider_status("urlscan", "unavailable", "Invalid provider response")
         return {"error": "not JSON"}
 
     items = data.get("results", []) or []
@@ -1118,7 +1365,7 @@ def _check_urlscan(domain):
 
 def _urlscan_submit(url):
     """Submit a URL to urlscan.io for a bounded live scan."""
-    if not URLSCAN_API_KEY or not http_requests or not url:
+    if not _provider_can_run("urlscan") or not url:
         return None
     try:
         resp = http_requests.post(
@@ -1131,8 +1378,13 @@ def _urlscan_submit(url):
             json={"url": url, "visibility": URLSCAN_VISIBILITY},
             timeout=HTTP_TIMEOUT,
         )
-    except Exception as exc:
-        return {"error": f"network: {exc}", "status": 0}
+    except Exception:
+        _record_provider_status("urlscan", "unavailable", "Network request failed")
+        return {"error": "urlscan.io unavailable", "status": 0}
+    if resp.status_code == 400:
+        _record_provider_status("urlscan", "enabled")
+    else:
+        _record_provider_http_status("urlscan", resp.status_code)
     if resp.status_code in (400, 401, 429):
         return {
             "error": {
@@ -1146,14 +1398,15 @@ def _urlscan_submit(url):
         return {"error": f"http {resp.status_code}", "status": resp.status_code}
     try:
         uuid = resp.json().get("uuid", "")
-    except Exception as exc:
-        return {"error": f"parse: {exc}", "status": 200}
+    except Exception:
+        _record_provider_status("urlscan", "unavailable", "Invalid provider response")
+        return {"error": "urlscan.io returned an invalid response", "status": 200}
     return {"uuid": uuid} if uuid else {"error": "no uuid returned", "status": 200}
 
 
 def _urlscan_result(uuid):
     """Fetch a urlscan result by uuid and normalize it to the search verdict shape."""
-    if not URLSCAN_API_KEY or not http_requests or not uuid:
+    if not _provider_can_run("urlscan") or not uuid:
         return None
     try:
         resp = http_requests.get(
@@ -1164,8 +1417,13 @@ def _urlscan_result(uuid):
             },
             timeout=HTTP_TIMEOUT,
         )
-    except Exception as exc:
-        return {"error": f"network: {exc}", "status": 0}
+    except Exception:
+        _record_provider_status("urlscan", "unavailable", "Network request failed")
+        return {"error": "urlscan.io unavailable", "status": 0}
+    if resp.status_code == 404:
+        _record_provider_status("urlscan", "enabled")
+    else:
+        _record_provider_http_status("urlscan", resp.status_code)
     if resp.status_code == 404:
         return {"pending": True}
     if resp.status_code != 200:
@@ -1179,8 +1437,9 @@ def _urlscan_result(uuid):
             for brand in (overall.get("brands") or [])
         })
         categories = sorted({str(cat) for cat in (overall.get("categories") or [])})
-    except Exception as exc:
-        return {"error": f"parse: {exc}", "status": 200}
+    except Exception:
+        _record_provider_status("urlscan", "unavailable", "Invalid provider response")
+        return {"error": "urlscan.io returned an invalid response", "status": 200}
     verdict = ("malicious" if (malicious or score >= 60)
                else "suspicious" if (score >= 30 or brands) else "clean")
     return {
@@ -1241,7 +1500,6 @@ def _check_urlhaus(url_or_domain):
     return None
 
 
-GSB_API_KEY = os.environ.get("GOOGLE_SAFE_BROWSING_KEY", "").strip()
 GSB_CACHE_TTL_SECONDS = 6 * 3600
 GSB_MAX_URLS = 500
 GSB_MAX_PREFIXES = 1000
@@ -1433,7 +1691,7 @@ def _gsb_parse_response(body):
 
 def _check_safe_browsing(urls):
     """Google Safe Browsing v5 hash-prefix lookup for a batch of URLs."""
-    if not GSB_API_KEY or not http_requests or not urls:
+    if not _provider_can_run("google_safe_browsing") or not urls:
         return {}
     now = datetime.now()
     to_query, cached_hits, seen = [], {}, set()
@@ -1475,6 +1733,12 @@ def _check_safe_browsing(urls):
         )
         body = resp.content if resp.status_code == 200 else b""
     except Exception:
+        _record_provider_status(
+            "google_safe_browsing", "unavailable", "Network request failed"
+        )
+        return cached_hits
+    _record_provider_http_status("google_safe_browsing", resp.status_code)
+    if resp.status_code != 200:
         return cached_hits
 
     matched = {}
@@ -1531,29 +1795,32 @@ def _extract_sender_ip(headers):
 
 def _check_abuseipdb_ip(ip):
     """AbuseIPDB reputation for the originating mail-sender IP."""
-    api_key = os.environ.get("ABUSEIPDB_KEY", "").strip()
-    if not api_key or not http_requests or not ip:
+    if not _provider_can_run("abuseipdb") or not ip:
         return None
     try:
         resp = http_requests.get(
             "https://api.abuseipdb.com/api/v2/check",
             params={"ipAddress": ip, "maxAgeInDays": 90},
-            headers={"Key": api_key, "Accept": "application/json"},
+            headers={"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"},
             timeout=HTTP_TIMEOUT,
         )
+        _record_provider_http_status("abuseipdb", resp.status_code)
         if resp.status_code == 200:
             data = resp.json().get("data", {})
             score = data.get("abuseConfidenceScore", 0)
             return {"ip": ip, "score": score, "is_abusive": score > 50}
+        return {
+            "error": "AbuseIPDB unavailable",
+            "status": resp.status_code,
+        }
     except Exception:
-        pass
-    return None
+        _record_provider_status("abuseipdb", "unavailable", "Network request failed")
+        return {"error": "AbuseIPDB unavailable", "status": 0}
 
 
 def _check_abuseipdb(domain):
     """AbuseIPDB IP reputation lookup; enabled only when ABUSEIPDB_KEY exists."""
-    api_key = os.environ.get("ABUSEIPDB_KEY", "").strip()
-    if not api_key or not http_requests:
+    if not _provider_can_run("abuseipdb"):
         return None
     try:
         ips = socket.getaddrinfo(domain, None, socket.AF_INET)
@@ -1563,16 +1830,18 @@ def _check_abuseipdb(domain):
         resp = http_requests.get(
             "https://api.abuseipdb.com/api/v2/check",
             params={"ipAddress": ip, "maxAgeInDays": 90},
-            headers={"Key": api_key, "Accept": "application/json"},
+            headers={"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"},
             timeout=HTTP_TIMEOUT,
         )
+        _record_provider_http_status("abuseipdb", resp.status_code)
         if resp.status_code == 200:
             data = resp.json().get("data", {})
             score = data.get("abuseConfidenceScore", 0)
             return {"score": score, "is_abusive": score > 50}
+        return {"error": "AbuseIPDB unavailable", "status": resp.status_code}
     except Exception:
-        pass
-    return None
+        _record_provider_status("abuseipdb", "unavailable", "Network request failed")
+        return {"error": "AbuseIPDB unavailable", "status": 0}
 
 
 def _check_domain_reputation(domain):
@@ -1824,6 +2093,38 @@ def _sender_domain_from_email(email):
     return sender.split("@")[-1].lower() if "@" in sender else ""
 
 
+_PROVIDER_OUTCOME_PRIORITY = {
+    "not_checked": 0,
+    "not_found": 1,
+    "not_flagged": 2,
+    "provider_unavailable": 3,
+    # Preserve a positive threat match even if a later indicator hits a
+    # provider outage or rate limit.
+    "flagged": 4,
+}
+
+
+def _record_scan_provider_outcome(results, provider_id, outcome, provider_result=None):
+    """Aggregate a provider's per-indicator results into one explicit outcome."""
+    if provider_id not in _PROVIDER_DEFINITIONS:
+        return
+    if isinstance(provider_result, dict) and provider_result.get("error"):
+        outcome = "provider_unavailable"
+    runtime = next(
+        item for item in _provider_public_statuses() if item["id"] == provider_id
+    )
+    if runtime["status"] in {"unavailable", "rate_limited"}:
+        outcome = "provider_unavailable"
+    if outcome not in _PROVIDER_OUTCOME_PRIORITY:
+        outcome = "not_checked"
+    current = results["provider_outcomes"][provider_id]["outcome"]
+    if _PROVIDER_OUTCOME_PRIORITY[outcome] >= _PROVIDER_OUTCOME_PRIORITY[current]:
+        results["provider_outcomes"][provider_id] = {
+            "outcome": outcome,
+            "reason": runtime["reason"] if outcome == "provider_unavailable" else "",
+        }
+
+
 def run_threat_intel(email, urls_in_email=None):
     """Run public URL/domain checks before the AI model verdict is finalized."""
     domain = _sender_domain_from_email(email)
@@ -1833,10 +2134,20 @@ def run_threat_intel(email, urls_in_email=None):
         "confirmed_phishing": False,
         "signals": [],
         "url_threats": {},
+        "provider_outcomes": {
+            provider_id: {"outcome": "not_checked", "reason": ""}
+            for provider_id in _PROVIDER_DEFINITIONS
+        },
     }
 
     if urls_in_email:
         gsb_hits = _check_safe_browsing(urls_in_email)
+        if _provider_can_run("google_safe_browsing"):
+            _record_scan_provider_outcome(
+                results,
+                "google_safe_browsing",
+                "flagged" if gsb_hits else "not_flagged",
+            )
         seen_hosts = set()
         urlhaus_calls = 0
         urlscan_live_submits = 0
@@ -1887,6 +2198,20 @@ def run_threat_intel(email, urls_in_email=None):
             ):
                 vt_url_calls += 1
                 vt_result = _check_virustotal_url(url)
+                if isinstance(vt_result, dict):
+                    _record_scan_provider_outcome(
+                        results,
+                        "virustotal",
+                        (
+                            "not_found" if vt_result.get("found") is False
+                            else "flagged" if (
+                                vt_result.get("malicious", 0)
+                                or vt_result.get("suspicious", 0)
+                            )
+                            else "not_flagged"
+                        ),
+                        vt_result,
+                    )
                 if isinstance(vt_result, dict) and vt_result.get("status") == 429:
                     vt_rate_limited = True
                 if (
@@ -1897,6 +2222,23 @@ def run_threat_intel(email, urls_in_email=None):
                 ):
                     vt_submits += 1
                     scanned = _vt_scan_url(url)
+                    if (
+                        isinstance(scanned, dict)
+                        and ("error" in scanned or scanned.get("found") is not None)
+                    ):
+                        _record_scan_provider_outcome(
+                            results,
+                            "virustotal",
+                            (
+                                "not_found" if scanned.get("found") is False
+                                else "flagged" if (
+                                    scanned.get("malicious", 0)
+                                    or scanned.get("suspicious", 0)
+                                )
+                                else "not_flagged"
+                            ),
+                            scanned,
+                        )
                     if isinstance(scanned, dict) and scanned.get("found"):
                         vt_result = scanned
                     elif isinstance(scanned, dict) and scanned.get("status") == 429:
@@ -1935,6 +2277,19 @@ def run_threat_intel(email, urls_in_email=None):
                     sources.append("URLhaus")
                 us_host = _check_urlscan(host)
                 if isinstance(us_host, dict):
+                    _record_scan_provider_outcome(
+                        results,
+                        "urlscan",
+                        (
+                            "not_found" if us_host.get("found") is False
+                            else "flagged" if (
+                                us_host.get("malicious")
+                                or us_host.get("verdict") == "suspicious"
+                            )
+                            else "not_flagged"
+                        ),
+                        us_host,
+                    )
                     if us_host.get("malicious"):
                         sources.append("urlscan.io")
                     elif us_host.get("verdict") == "suspicious":
@@ -1962,6 +2317,18 @@ def run_threat_intel(email, urls_in_email=None):
                                 scheme = "https"
                             live = _urlscan_live_scan(f"{scheme}://{host}", host)
                             if isinstance(live, dict):
+                                if "error" in live or live.get("verdict"):
+                                    _record_scan_provider_outcome(
+                                        results,
+                                        "urlscan",
+                                        (
+                                            "flagged" if live.get("verdict") in {
+                                                "malicious", "suspicious"
+                                            }
+                                            else "not_flagged"
+                                        ),
+                                        live,
+                                    )
                                 if live.get("status") == 429:
                                     urlscan_rate_limited = True
                                 elif live.get("verdict") == "malicious":
@@ -2014,6 +2381,13 @@ def run_threat_intel(email, urls_in_email=None):
 
     aip = _check_abuseipdb_ip(_extract_sender_ip(email.get("internetMessageHeaders")))
     results["checks"]["abuseipdb"] = aip
+    if isinstance(aip, dict):
+        _record_scan_provider_outcome(
+            results,
+            "abuseipdb",
+            "flagged" if aip.get("is_abusive") else "not_flagged",
+            aip,
+        )
     if aip and isinstance(aip, dict) and aip.get("is_abusive"):
         results["signals"].append(
             f"AbuseIPDB: sending IP {aip.get('ip')} has {aip['score']}% abuse confidence"
@@ -2021,6 +2395,19 @@ def run_threat_intel(email, urls_in_email=None):
 
     us = _check_urlscan(domain)
     results["checks"]["urlscan"] = us
+    if isinstance(us, dict):
+        _record_scan_provider_outcome(
+            results,
+            "urlscan",
+            (
+                "not_found" if us.get("found") is False
+                else "flagged" if (
+                    us.get("malicious") or us.get("verdict") == "suspicious"
+                )
+                else "not_flagged"
+            ),
+            us,
+        )
     if us and isinstance(us, dict) and us.get("found"):
         brands = us.get("brands") or []
         brand_note = (" impersonating " + ", ".join(brands)) if brands else ""
@@ -2189,13 +2576,14 @@ def get_detection_rules():
 
 @app.route("/api/settings", methods=["GET"])
 def get_settings():
-    """Return minimal app settings expected by the newer renderer."""
+    """Return non-secret app and provider status for the renderer."""
     sess = _current_session()
     return jsonify({
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_ANON_KEY),
         "graph_connected": bool(sess.graph_token["access_token"] and sess.live_mode),
         "logging_enabled": False,
         "user_data_dir": str(USER_DATA_DIR),
+        "providers": _provider_public_statuses(),
     })
 
 
@@ -2847,7 +3235,7 @@ def _fetch_attachment_bytes(sess, message_id, attachment_id):
 
 def _vt_scan_attachments(sess, message_id, attachments):
     """Hash attachments locally and look up the hash on VirusTotal."""
-    if not VIRUSTOTAL_API_KEY or not attachments:
+    if not _provider_can_run("virustotal") or not attachments:
         return attachments
     scanned = 0
     for attachment in attachments:
@@ -2987,18 +3375,29 @@ def analyze_message_attachment(message_id, attachment_id):
         return jsonify({"error": "Attachment not found"}), 404
 
     name = att.get("name", "") or att.get("filename", "") or "file"
-    if not VIRUSTOTAL_API_KEY:
+    vt_status = next(
+        item for item in _provider_public_statuses() if item["id"] == "virustotal"
+    )
+    if not vt_status["configured"] or not vt_status["enabled"]:
         return jsonify({
-            "configured": False,
+            "configured": vt_status["configured"],
+            "enabled": vt_status["enabled"],
+            "outcome": "not_checked",
             "name": name,
-            "message": "VirusTotal API key not configured. Set VIRUSTOTAL_API_KEY to enable.",
+            "message": (
+                "VirusTotal is disabled."
+                if vt_status["configured"]
+                else "VirusTotal API key is not configured."
+            ),
         })
 
     content_bytes = _fetch_attachment_bytes(sess, message_id, att.get("id") or attachment_id)
     if not content_bytes:
         return jsonify({
             "configured": True,
+            "enabled": True,
             "analyzed": False,
+            "outcome": "not_checked",
             "name": name,
             "message": "Could not fetch attachment bytes; analysis requires real Outlook mail.",
         })
@@ -3008,7 +3407,9 @@ def analyze_message_attachment(message_id, attachment_id):
     if result is None:
         return jsonify({
             "configured": False,
+            "enabled": False,
             "analyzed": False,
+            "outcome": "not_checked",
             "name": name,
             "sha256": sha,
             "message": "VT lookup returned no configuration.",
@@ -3017,7 +3418,9 @@ def analyze_message_attachment(message_id, attachment_id):
     if "error" in result:
         return jsonify({
             "configured": True,
+            "enabled": True,
             "analyzed": False,
+            "outcome": "provider_unavailable",
             "name": name,
             "sha256": sha,
             "error": result.get("error", "unknown error"),
@@ -3026,7 +3429,13 @@ def analyze_message_attachment(message_id, attachment_id):
 
     return jsonify({
         "configured": True,
+        "enabled": True,
         "analyzed": True,
+        "outcome": (
+            "not_found" if result.get("found") is False
+            else "flagged" if result.get("malicious", 0) or result.get("suspicious", 0)
+            else "not_flagged"
+        ),
         "name": name,
         "size": len(content_bytes),
         **result,
@@ -3048,9 +3457,28 @@ def deepscan_message_attachment(message_id, attachment_id):
         return jsonify({"error": "Attachment not found"}), 404
 
     name = _attachment_name(attachment)
-    if not VIRUSTOTAL_API_KEY:
-        return jsonify({"configured": False, "name": name,
-                        "message": "VirusTotal API key not configured."})
+    vt_status = next(
+        item for item in _provider_public_statuses() if item["id"] == "virustotal"
+    )
+    if not vt_status["configured"] or not vt_status["enabled"]:
+        return jsonify({
+            "configured": vt_status["configured"],
+            "enabled": vt_status["enabled"],
+            "outcome": "not_checked",
+            "name": name,
+            "message": (
+                "VirusTotal is disabled."
+                if vt_status["configured"]
+                else "VirusTotal API key is not configured."
+            ),
+        })
+
+    confirmation = request.get_json(silent=True) or {}
+    if confirmation.get("confirm_upload") is not True:
+        return jsonify({
+            "error": "Explicit upload confirmation required",
+            "confirmation_required": True,
+        }), 400
 
     content_bytes = _fetch_attachment_bytes(sess, message_id, attachment.get("id", ""))
     if not content_bytes:
@@ -3507,7 +3935,7 @@ def _score_link(url, url_threats, analyzer, is_deceptive=False):
                   else "trusted" if trusted else "clean" if urlscan_clean else "unknown")
     sources = (url_feed.get("sources") or []) + (host_feed.get("sources") or [])
     checks = []
-    if GSB_API_KEY and http_requests:
+    if _provider_can_run("google_safe_browsing"):
         checks.append({
             "src": "Google Safe Browsing",
             "result": "flagged" if any("Google Safe Browsing" in s for s in sources) else "clean",
@@ -3573,7 +4001,7 @@ def _score_link(url, url_threats, analyzer, is_deceptive=False):
                 ), "model_uncorroborated"
     if feed_suspicious and score < 70:
         score, reason, decided = 70, "Prior urlscan analyses scored this link's host risky.", "reputation_suspicious"
-    gsb_active = bool(GSB_API_KEY and http_requests)
+    gsb_active = _provider_can_run("google_safe_browsing")
     if urlscan_clean and decided == "structural" and score <= 25:
         vetted = (["Google Safe Browsing"] if gsb_active else []) + ["urlscan"]
         score, reason, decided = (
@@ -4160,6 +4588,9 @@ def _scan_email_common(sess, email, idx):
             "signals": threat_intel["signals"],
             "checks": _to_native(threat_intel["checks"]),
             "checks_run": list(threat_intel["checks"].keys()),
+            "provider_outcomes": _to_native(
+                threat_intel.get("provider_outcomes") or {}
+            ),
         },
     }
     sess.scan_results[message_id] = result
@@ -4237,4 +4668,5 @@ def get_stats_v2():
 if __name__ == "__main__":
     port = int(os.environ.get("FLASK_PORT", "5050"))
     debug = os.environ.get("PHISHGUARD_DEBUG") == "1"
+    _start_provider_control_channel()
     app.run(host="127.0.0.1", debug=debug, port=port, use_reloader=debug)

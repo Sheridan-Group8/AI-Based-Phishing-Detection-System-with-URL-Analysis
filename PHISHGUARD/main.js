@@ -1,13 +1,15 @@
-const { app, BrowserWindow, ipcMain, shell, session } = require('electron');
+const { app, BrowserWindow, ipcMain, safeStorage, shell, session } = require('electron');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
 const http = require('http');
+const { ProviderSettingsStore } = require('./provider-settings');
 
 let mainWindow = null;
 let pythonProcess = null;
+let providerSettingsStore = null;
 // Bound at startup. NEVER a fixed well-known port — the original 5050 could
 // be impersonated by any other local process listening on the same socket,
 // which would happily answer the Electron renderer's first fetch.
@@ -16,6 +18,35 @@ let flaskPort = 0;
 // from the renderer Electron spawned, and to preload so the renderer can
 // attach it as X-Launch-Secret on every fetch.
 let launchSecret = '';
+
+function isTrustedRendererEvent(event) {
+    if (!mainWindow || !event || event.sender !== mainWindow.webContents) return false;
+    const url = event.senderFrame && event.senderFrame.url;
+    return typeof url === 'string'
+        && url.startsWith(`http://127.0.0.1:${flaskPort}/`);
+}
+
+function sendProviderConfigurationToBackend() {
+    if (
+        !providerSettingsStore
+        || !pythonProcess
+        || pythonProcess.killed
+        || !pythonProcess.stdin
+        || pythonProcess.stdin.destroyed
+    ) {
+        return false;
+    }
+    // This is the only path by which a user-supplied key reaches Flask. The
+    // JSON line goes over the spawned child's private stdin pipe and is never
+    // returned by HTTP, IPC, command-line arguments, or renderer state.
+    const message = providerSettingsStore.backendConfiguration();
+    try {
+        pythonProcess.stdin.write(`${JSON.stringify(message)}\n`);
+        return true;
+    } catch (_error) {
+        return false;
+    }
+}
 
 function findPython() {
     const candidates = [];
@@ -159,6 +190,7 @@ async function startFlask() {
         try {
             pythonProcess = spawn(launcher.command, launcher.args, {
                 cwd: launcher.cwd,
+                windowsHide: true,
                 env: {
                     ...process.env,
                     FLASK_PORT: String(flaskPort),
@@ -175,6 +207,9 @@ async function startFlask() {
             pythonProcess.stderr.on('data', (data) => {
                 console.log(`[PhishGuard backend] ${data.toString().trim()}`);
             });
+            pythonProcess.stdin.on('error', () => {
+                console.warn('Backend settings channel is unavailable.');
+            });
             pythonProcess.on('error', (err) => {
                 console.error(`Backend process error: ${err.message}`);
                 pythonProcess = null;
@@ -186,6 +221,7 @@ async function startFlask() {
 
             await new Promise(r => setTimeout(r, 500));
             if (pythonProcess && !pythonProcess.killed) {
+                sendProviderConfigurationToBackend();
                 console.log(`Started PhishGuard backend with: ${launcher.label} (port ${flaskPort})`);
                 return;
             }
@@ -328,8 +364,53 @@ ipcMain.handle('pg:open-external', async (_event, url) => {
     }
 });
 
+ipcMain.handle('pg:provider-settings:get', async (event) => {
+    if (!isTrustedRendererEvent(event) || !providerSettingsStore) {
+        return { ok: false, reason: 'Forbidden' };
+    }
+    return { ok: true, ...providerSettingsStore.publicSettings() };
+});
+
+ipcMain.handle('pg:provider-settings:update', async (event, providerId, changes) => {
+    if (!isTrustedRendererEvent(event) || !providerSettingsStore) {
+        return { ok: false, reason: 'Forbidden' };
+    }
+    try {
+        const settings = providerSettingsStore.update(providerId, changes);
+        sendProviderConfigurationToBackend();
+        return { ok: true, ...settings };
+    } catch (error) {
+        return {
+            ok: false,
+            code: error && error.code ? error.code : 'INVALID_SETTINGS',
+            reason: error && error.message ? error.message : 'Settings update failed',
+        };
+    }
+});
+
+ipcMain.handle('pg:provider-settings:clear-key', async (event, providerId) => {
+    if (!isTrustedRendererEvent(event) || !providerSettingsStore) {
+        return { ok: false, reason: 'Forbidden' };
+    }
+    try {
+        const settings = providerSettingsStore.clearUserKey(providerId);
+        sendProviderConfigurationToBackend();
+        return { ok: true, ...settings };
+    } catch (error) {
+        return {
+            ok: false,
+            code: 'INVALID_SETTINGS',
+            reason: error && error.message ? error.message : 'Could not remove key',
+        };
+    }
+});
+
 app.whenReady().then(async () => {
     try {
+        providerSettingsStore = new ProviderSettingsStore({
+            userDataDir: app.getPath('userData'),
+            safeStorage,
+        });
         await startFlask();
         await waitForFlask(flaskPort, launchSecret);
         createWindow();
