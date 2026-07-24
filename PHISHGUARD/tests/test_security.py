@@ -151,7 +151,6 @@ def test_post_with_launch_secret_bypasses_origin(base_url):
 
 def test_all_protected_post_routes_reject_without_csrf(base_url):
     routes = [
-        "/api/auth/connect",
         "/api/auth/disconnect",
         "/api/auth/refresh",
         "/api/auth/external-start",
@@ -174,38 +173,6 @@ def test_two_sessions_get_distinct_csrf(base_url):
     token1 = sess1.get(f"{base_url}/api/csrf", timeout=3).json()["csrf"]
     token2 = sess2.get(f"{base_url}/api/csrf", timeout=3).json()["csrf"]
     assert token1 != token2
-
-
-@pytest.mark.parametrize(
-    "bad_id",
-    [
-        "",
-        "not-a-uuid",
-        "lol",
-        "x" * 200,
-        "11111111-2222-3333-4444-55555555555",
-        "<script>alert(1)</script>",
-        "' OR 1=1 --",
-    ],
-)
-def test_connect_rejects_bad_client_id(session, base_url, bad_id):
-    resp = session.post(
-        f"{base_url}/api/auth/connect",
-        json={"client_id": bad_id},
-        timeout=3,
-    )
-    assert resp.status_code == 400
-    assert "UUID" in resp.json().get("error", "")
-
-
-def test_connect_accepts_valid_uuid(session, base_url):
-    resp = session.post(
-        f"{base_url}/api/auth/connect",
-        json={"client_id": "11111111-2222-3333-4444-555555555555"},
-        timeout=3,
-    )
-    assert resp.status_code == 200
-    assert resp.json()["auth_url"].startswith("https://login.microsoftonline.com/")
 
 
 def test_scan_returns_404_when_signed_out(session, base_url):

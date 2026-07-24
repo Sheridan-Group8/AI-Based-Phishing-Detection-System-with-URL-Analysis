@@ -16,6 +16,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "provider-settings.js",
       "app.py",
       "phishing_detector.py",
       "bigmodel/onnx-model/**/*",

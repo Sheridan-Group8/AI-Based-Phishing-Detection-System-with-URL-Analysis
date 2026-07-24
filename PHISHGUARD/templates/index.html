@@ -537,7 +537,7 @@
 
     <!-- ============ SETTINGS MODAL ============ -->
     <div class="modal-overlay" id="settingsModal" style="display:none;">
-        <div class="modal-box">
+        <div class="modal-box settings-modal-box">
             <div class="modal-header">
                 <h2 class="modal-title">Settings</h2>
                 <button class="modal-close" id="settingsClose">&times;</button>
@@ -589,6 +589,133 @@
                             <span class="toggle-icon toggle-icon-moon"></span>
                         </span>
                     </label>
+                </div>
+
+                <div class="settings-section provider-settings-section">
+                    <div class="provider-settings-heading">
+                        <div>
+                            <label class="settings-label">Threat intelligence providers</label>
+                            <p>Optional remote checks. Local scanning still runs when every provider is off.</p>
+                        </div>
+                        <button class="provider-refresh-btn" id="providerRefreshBtn" type="button">Refresh</button>
+                    </div>
+
+                    <div class="provider-storage-notice" id="providerStorageNotice" role="status">
+                        Checking protected credential storage…
+                    </div>
+
+                    <div class="provider-list" id="providerList">
+                        <article class="provider-card" data-provider="virustotal">
+                            <div class="provider-card-head">
+                                <div>
+                                    <h3>VirusTotal</h3>
+                                    <div class="provider-badges">
+                                        <span class="provider-status" data-provider-status>Checking…</span>
+                                        <span class="provider-key-source" data-provider-source></span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch provider-toggle" title="Enable VirusTotal">
+                                    <input type="checkbox" data-provider-enabled disabled>
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <p class="provider-privacy"><strong>Privacy:</strong> Receives extracted URLs and SHA-256 attachment hashes. Attachment contents are uploaded only after a separate confirmation.</p>
+                            <div class="provider-key-row">
+                                <input class="settings-input provider-key-input" type="password"
+                                       data-provider-key autocomplete="off" spellcheck="false"
+                                       aria-label="VirusTotal API key"
+                                       placeholder="Enter or replace API key">
+                                <button class="btn provider-save-key" type="button" data-provider-save>Save key</button>
+                                <button class="provider-remove-key" type="button" data-provider-remove hidden>Remove my key</button>
+                            </div>
+                            <div class="provider-feedback" data-provider-feedback aria-live="polite"></div>
+                        </article>
+
+                        <article class="provider-card" data-provider="google_safe_browsing">
+                            <div class="provider-card-head">
+                                <div>
+                                    <h3>Google Safe Browsing</h3>
+                                    <div class="provider-badges">
+                                        <span class="provider-status" data-provider-status>Checking…</span>
+                                        <span class="provider-key-source" data-provider-source></span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch provider-toggle" title="Enable Google Safe Browsing">
+                                    <input type="checkbox" data-provider-enabled disabled>
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <p class="provider-privacy"><strong>Privacy:</strong> Receives 4-byte SHA-256 prefixes derived from URLs in the message; PhishGuard does not send the complete URL in this lookup.</p>
+                            <div class="provider-key-row">
+                                <input class="settings-input provider-key-input" type="password"
+                                       data-provider-key autocomplete="off" spellcheck="false"
+                                       aria-label="Google Safe Browsing API key"
+                                       placeholder="Enter or replace API key">
+                                <button class="btn provider-save-key" type="button" data-provider-save>Save key</button>
+                                <button class="provider-remove-key" type="button" data-provider-remove hidden>Remove my key</button>
+                            </div>
+                            <div class="provider-feedback" data-provider-feedback aria-live="polite"></div>
+                        </article>
+
+                        <article class="provider-card" data-provider="urlscan">
+                            <div class="provider-card-head">
+                                <div>
+                                    <h3>urlscan.io</h3>
+                                    <div class="provider-badges">
+                                        <span class="provider-status" data-provider-status>Checking…</span>
+                                        <span class="provider-key-source" data-provider-source></span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch provider-toggle" title="Enable urlscan.io">
+                                    <input type="checkbox" data-provider-enabled disabled>
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <p class="provider-privacy"><strong>Privacy:</strong> Receives sender/link domains for search. Unfamiliar link hosts may be submitted as an unlisted URL for a live scan.</p>
+                            <div class="provider-key-row">
+                                <input class="settings-input provider-key-input" type="password"
+                                       data-provider-key autocomplete="off" spellcheck="false"
+                                       aria-label="urlscan.io API key"
+                                       placeholder="Enter or replace API key">
+                                <button class="btn provider-save-key" type="button" data-provider-save>Save key</button>
+                                <button class="provider-remove-key" type="button" data-provider-remove hidden>Remove my key</button>
+                            </div>
+                            <div class="provider-feedback" data-provider-feedback aria-live="polite"></div>
+                        </article>
+
+                        <article class="provider-card" data-provider="abuseipdb">
+                            <div class="provider-card-head">
+                                <div>
+                                    <h3>AbuseIPDB</h3>
+                                    <div class="provider-badges">
+                                        <span class="provider-status" data-provider-status>Checking…</span>
+                                        <span class="provider-key-source" data-provider-source></span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch provider-toggle" title="Enable AbuseIPDB">
+                                    <input type="checkbox" data-provider-enabled disabled>
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <p class="provider-privacy"><strong>Privacy:</strong> Receives the public originating IP address extracted from the message headers.</p>
+                            <div class="provider-key-row">
+                                <input class="settings-input provider-key-input" type="password"
+                                       data-provider-key autocomplete="off" spellcheck="false"
+                                       aria-label="AbuseIPDB API key"
+                                       placeholder="Enter or replace API key">
+                                <button class="btn provider-save-key" type="button" data-provider-save>Save key</button>
+                                <button class="provider-remove-key" type="button" data-provider-remove hidden>Remove my key</button>
+                            </div>
+                            <div class="provider-feedback" data-provider-feedback aria-live="polite"></div>
+                        </article>
+                    </div>
+
+                    <p class="provider-privacy-summary">
+                        Separate built-in checks do not use these keys: URLhaus receives link/sender
+                        host names, RDAP and DNS receive sender domains, and OpenPhish URLs are
+                        downloaded as a feed and matched locally. Keys are never saved to Supabase
+                        or included in scan history, logs, or error reports.
+                    </p>
                 </div>
 
             </div>

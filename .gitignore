@@ -28,6 +28,8 @@ __MACOSX/
 node_modules/
 dist/
 build/
+/PHISHGUARD/backend-build/
+/PHISHGUARD/backend-dist/
 
 # Environment secrets
 .env

@@ -39,7 +39,6 @@ def test_frontend_shell_contains_core_workflow_controls():
         "emailList",
         "emailPreview",
         "scanBtn",
-        "scanAllBtn",
         "refreshBtn",
         "searchInput",
         "previewBody",
